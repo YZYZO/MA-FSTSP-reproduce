@@ -203,14 +203,59 @@ class LinearProgramming(Baseline):
         model.addConstr(obj >= (weights * route).sum())
         # 设置最小化目标。
         model.setObjective(obj, GRB.MINIMIZE)
+
         # 调用求解器求解。
+        # model.optimize()
+        # # 若达到时间上限，则返回当前下界作为成本。
+        # if model.Status == GRB.TIME_LIMIT:
+        #     self.solution = []
+        #     self.cost = model.getAttr(gp.GRB.Attr.ObjBound)
+        # else:
+        #     # 否则直接取最优目标值作为成本。
+        #     #self.cost = model.ObjVal
+        #     self.cost = model.getAttr(GRB.Attr.ObjVal)
+        # # 返回统一格式的空解和成本。
+        # return self.solution, self.cost
+
+
         model.optimize()
-        # 若达到时间上限，则返回当前下界作为成本。
-        if model.Status == GRB.TIME_LIMIT:
+
+        status = model.Status
+
+        print("Gurobi status:", status)
+        print("Solution count:", model.SolCount)
+
+        if model.SolCount > 0:
+            # 有可行解，不管是否证明最优，都可以读 ObjVal
+            self.cost = model.ObjVal
+
+        elif status == GRB.INFEASIBLE:
             self.solution = []
-            self.cost = model.getAttr(gp.GRB.Attr.ObjBound)
+            self.cost = None
+            print("Model is infeasible.")
+
+            # 可选：导出不可行约束分析文件
+            model.computeIIS()
+            model.write("lp_model_infeasible.ilp")
+
+        elif status == GRB.INF_OR_UNBD:
+            self.solution = []
+            self.cost = None
+            print("Model is infeasible or unbounded. Try DualReductions=0.")
+
+        elif status == GRB.UNBOUNDED:
+            self.solution = []
+            self.cost = None
+            print("Model is unbounded.")
+
+        elif status == GRB.TIME_LIMIT:
+            self.solution = []
+            self.cost = None
+            print("Time limit reached, but no feasible solution was found.")
+
         else:
-            # 否则直接取最优目标值作为成本。
-            self.cost = model.objVal
-        # 返回统一格式的空解和成本。
+            self.solution = []
+            self.cost = None
+            print("Optimization ended without available solution. Status =", status)
+
         return self.solution, self.cost

@@ -19,14 +19,14 @@ RESULTS_DIR = PROJECT_ROOT / 'results'
 
 # Experiment mode. Keep this False for quick local checks; set True for the
 # paper-scale experiment suite, which can take a long time on older CPUs.
-RUN_FULL_EXPERIMENTS = False
+RUN_FULL_EXPERIMENTS = True
 
 # OSMnx/Boston map download settings.
 ALLOW_OSM_DOWNLOAD = True
-REFRESH_OSM = False
+REFRESH_OSM = True
 OSM_CENTER_POINT = (42.3601, -71.0589)
 OSM_DIST_METERS = 1600
-OSM_MAX_NODES = 900
+OSM_MAX_NODES = 11000
 OSM_TIMEOUT = 300
 OVERPASS_ENDPOINTS = (
     'https://overpass.kumi.systems/api',

@@ -12,9 +12,9 @@
             "program": "${file}",
             "console": "integratedTerminal",
             //指定python路径
-            "python": "E:/anaconda/envs/MA-FSTSP/python.exe",
+            "python": "/data/yongzhi/yangziheng/miniconda3/envs/MA-FSTSP/bin/python",
             //进入程序暂停执行
-            "stopOnEntry": true
+            //"stopOnEntry": true
 
         }
     ]

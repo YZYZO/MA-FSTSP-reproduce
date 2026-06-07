@@ -49,7 +49,9 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         self.const = math.sqrt(2)
 
         #语法：解包并合并两个字典，键相同时后面覆盖前面
-        
+        #作用：首先对客户节点（city），搜索整个图，保留无人机航程内的地图节点，组成键值对，构成客户集合
+        #      其次对仓库节点（depot），只保留自己本身，组成键值对，构成仓库集合
+        #      最后将客户集合与仓库集合合并
         self.regions = {**{ city: [node for node in self.graph.nodes if
                                     self.distance['drone'][node][city] < self.limit / 2] 
                             for city in cities},
@@ -184,6 +186,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         """
         n = len(convex_sets)
         model = gp.Model('Set-TSP')
+        #日志输出设置
         model.setParam("OutputFlag", 0)
         # first write a tsp for the visiting order of convex sets using GG model
         select = model.addMVar((n, n), vtype=GRB.BINARY)
@@ -249,6 +252,94 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         2. 用 `appr` 近似估计同时投放多架无人机时的代价。
         3. 通过前缀 DP 累积卡车与无人机联合路线。
         """
+        # # value as defined in Eq. (13)
+        # value = [{node: float('inf') for node in self.graph.nodes} for _ in range(2 * len(seq) - 2)]
+        # value[0][depot] = 0
+        # # appr is the time defined in Eq. (9)
+        # appr = [[{node: {} for node in self.regions[city]} for _ in range(self.drone)] for city in seq[1:-1]]
+        # # tour record the optimal tour to reach each time (appr value) defined in Eq. (9)
+        # tour = [[{node: {} for node in self.regions[city]} for _ in range(self.drone)] for city in seq[1:-1]]
+        # # group record the number of customers before visited together with the current customer
+        # group = [1 for _ in seq[1:-1]]  # seq[i] has the same departure node as seq[i - group[i - 1] + 1]
+        # # prefix record the optimal tour to reach the corresponding value in Eq. (13)
+        # prefix = [{node: {'truck': [], 'drone': []} for node in self.graph.nodes} for _ in range(2 * len(seq) - 2)]
+        # prefix[0][depot]['truck'] = [depot]
+
+        # for i in range(1, len(seq) - 1):
+        #     for node in self.regions[seq[i]]:
+        #         for _node in self.regions[seq[i]]:
+        #             # initialize appr as Eq. (8)
+        #             drone_time = self.distance['drone'][seq[i]][_node] + self.distance['drone'][seq[i]][node]
+        #             truck_time = self.distance['truck'][_node][seq[i]] + self.distance['truck'][seq[i]][node]
+
+        #             tour[i - 1][0][node][_node] = {'truck': [], 'drone': []}
+        #             if drone_time <= self.limit:
+        #                 appr[i - 1][0][node][_node] = max(drone_time / self.speed, self.distance['truck'][_node][node])
+        #                 tour[i - 1][0][node][_node]['truck'] = [_node, node]
+        #                 tour[i - 1][0][node][_node]['drone'] = [[_node, seq[i], node]]
+        #             else:
+        #                 appr[i - 1][0][node][_node] = truck_time
+        #                 tour[i - 1][0][node][_node]['truck'] = [_node, seq[i], node]
+
+        #     # track the number of possible customers to be visited together
+        #     while i - 1 - group[i - 1] >= 0 and group[i - 1] <= group[i - 2] and group[i - 1] < self.drone:
+        #         if self.distance['drone'][seq[i - group[i - 1]]][seq[i]] < 2 * self.limit:
+        #             group[i - 1] += 1
+        #         else:
+        #             break
+        #     for j in range(1, group[i - 1]):
+        #         # assume throw all together, then
+        #         for node in self.regions[seq[i]]:
+        #             for _node in self.regions[seq[i - j]]:
+        #                 # Eq. (9)
+        #                 appr[i - 1][j][node][_node] = float('inf')
+        #                 tour[i - 1][j][node][_node] = {'truck': [], 'drone': []}
+
+        #                 consumption = self.distance['drone'][seq[i]][_node] + self.distance['drone'][seq[i]][node]
+        #                 if consumption > self.limit:
+        #                     continue
+        #                 for _mid in self.regions[seq[i - 1]]:
+        #                     cost = max(appr[i - 2][j - 1][_mid][_node] + self.distance['truck'][_mid][node],
+        #                                consumption / self.speed)
+        #                     if cost < appr[i - 1][j][node][_node]:
+        #                         appr[i - 1][j][node][_node] = cost
+        #                         tour[i - 1][j][node][_node]['truck'] = tour[i - 2][j - 1][_mid][_node][
+        #                                                                    'truck'].copy() + [node]
+        #                         tour[i - 1][j][node][_node]['drone'] = tour[i - 2][j - 1][_mid][_node][
+        #                                                                    'drone'].copy() + [[_node, seq[i], node]]
+
+        # for i in range(1, len(seq) - 1):
+        #     for node in self.regions[seq[i]]:
+        #         for _node in self.regions[seq[i - 1]]:
+        #             # initialize value as Eq. (12)
+        #             if value[2 * i - 2][_node] + self.distance['truck'][_node][node] < value[2 * i - 1][node]:
+        #                 value[2 * i - 1][node] = value[2 * i - 2][_node] + self.distance['truck'][_node][node]
+        #                 prefix[2 * i - 1][node]['truck'] = prefix[2 * i - 2][_node]['truck'].copy() + [node]
+        #                 prefix[2 * i - 1][node]['drone'] = prefix[2 * i - 2][_node]['drone'].copy()
+
+        #     for j in range(min(self.drone, i)):
+        #         for node in self.regions[seq[i]]:
+        #             for _node in self.regions[seq[i - j]]:
+        #                 # approximation method to estimate the time consumption as Eq. (13)
+        #                 if _node not in appr[i - 1][j][node].keys():
+        #                     continue
+        #                 if value[2 * i - 2 * j - 1][_node] + appr[i - 1][j][node][_node] < value[2 * i][node]:
+        #                     value[2 * i][node] = value[2 * i - 2 * j - 1][_node] + appr[i - 1][j][node][_node]
+        #                     prefix[2 * i][node]['truck'] = prefix[2 * i - 2 * j - 1][_node]['truck'].copy() + \
+        #                                                    tour[i - 1][j][node][_node]['truck'].copy()
+        #                     prefix[2 * i][node]['drone'] = prefix[2 * i - 2 * j - 1][_node]['drone'].copy() + \
+        #                                                    tour[i - 1][j][node][_node]['drone'].copy()
+
+        # for node in self.regions[seq[-2]]:
+        #     # after visiting the last customer, return to the depot
+        #     if value[2 * len(seq) - 4][node] + self.distance['truck'][node][depot] < value[2 * len(seq) - 3][depot]:
+        #         value[2 * len(seq) - 3][depot] = value[2 * len(seq) - 4][node] + self.distance['truck'][node][depot]
+        #         prefix[2 * len(seq) - 3][depot]['truck'] = prefix[2 * len(seq) - 4][node]['truck'].copy() + [depot]
+        #         prefix[2 * len(seq) - 3][depot]['drone'] = prefix[2 * len(seq) - 4][node]['drone'].copy()
+
+        # return prefix[2 * len(seq) - 3][depot], value[2 * len(seq) - 3][depot]
+
+
         # value as defined in Eq. (13)
         value = [{node: float('inf') for node in self.graph.nodes} for _ in range(2 * len(seq) - 2)]
         value[0][depot] = 0
@@ -304,6 +395,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                                                                            'truck'].copy() + [node]
                                 tour[i - 1][j][node][_node]['drone'] = tour[i - 2][j - 1][_mid][_node][
                                                                            'drone'].copy() + [[_node, seq[i], node]]
+            #print("@")
 
         for i in range(1, len(seq) - 1):
             for node in self.regions[seq[i]]:
@@ -444,11 +536,16 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         实现逻辑：
         - 若某节点属于某客户区域，但存在邻居不属于该区域，则把该节点视为边界点。
         """
+        #计算得到convex_sets字典，表示每个客户服务范围内的地图节点，键为客户，值为该客户服务范围内的点
         convex_sets = self.get_convex_sets(theta)
+        #初始化边界点集合
+        #语法：字典推导式，遍历所有客户，创建键值对，键为客户（city），值为空
         boundary_convex_sets = {city: [] for city in self.cities}
+        #遍历每个客户的，服务范围内的点的，邻居节点
         for city in self.cities:
             for node in convex_sets[city]:
                 for neighbor in nx.neighbors(self.graph, node):
+                    #若该点的邻居点不在服务范围（集合）内，则说明该点是边界点
                     if neighbor not in convex_sets[city]:
                         boundary_convex_sets[city].append(node)
                         break
@@ -470,12 +567,18 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         3. 对每个仓库单独求解联合路线。
         4. 汇总所有仓库的结果。
         """
+        #获取客户服务范围（集合）内的边界点，加速计算
         convex_sets = self.get_boundary_convex_sets(self.theta[0])
+        #用mst算法为仓库分配对应的客户
         self.set_mst(convex_sets)
-        for depot in self.depots:
+        #对每个仓库（每个客户分组） 
+        for depot in self.depots:     
+            #创建当前仓库及其对应客户的点集合 的集合convex_set
             convex_set = [[depot]] + [convex_sets[city] for city in self.groups[depot]]
-            solution = self.single_solution(depot, convex_set)
-            self.solution.append(self.convert(solution))
+            #对当前仓库求解
+            solution = self.single_solution(depot, convex_set) 
+            #将解统一格式后返回
+            self.solution.append(self.convert(solution)) 
         return self.solution, self.cost
 
     # function that helps fast generate the results for the ablation study of the drone numbers

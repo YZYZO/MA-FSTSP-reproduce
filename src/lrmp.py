@@ -443,7 +443,10 @@ class LinearRelaxedMasterProblem(Baseline):
         输出：
         - 无显式返回值；若找到更优扰动路线则加入路线池。
         """
-        nodes_must_visit = [route['road'][0]] + np.random.choice(self.nodes, len(route['road']) - 1).tolist()
+        depot = route['road'][0]
+        candidates = [node for node in self.nodes if node != depot]
+        sample_size = min(len(route['road']) - 1, len(candidates))
+        nodes_must_visit = [depot] + np.random.choice(candidates, sample_size, replace=False).tolist()
         truck_route, _truck_route = self.solve_truck_route(nodes_must_visit)
         drone_route, cost = self.solve_drone_route(_truck_route, route['cities'])
         if cost < route['cost']:
@@ -479,13 +482,17 @@ class LinearRelaxedMasterProblem(Baseline):
         drone_route, cost = self.solve_drone_route(_truck_route, cities)
         # based on initial solution, do neighborhood search
         route = {'truck': truck_route, 'drone': drone_route, 'cost': cost, 'cities': cities,
-                 'road': nodes_must_visit}
+                 'road': _truck_route.copy()}
         reduced_cost, iters = 0, 0
-        while (reduced_cost < 0 and iters < 10) or iters < 1:
+        while iters < 10 and (iters == 0 or reduced_cost < 0):
             route, reduced_cost = self.neighborhood_search(route, theta)
+            iters += 1
             if reduced_cost == 0:
                 self.shake(route)
-                iters += 1
+                break
+        if route['cost'] < init_cost:
+            self.routes.append(route)
+            self.update_y()
         return route['cost'] - init_cost
 
     def master_problem(self):
@@ -743,8 +750,9 @@ class LinearRelaxedMasterProblem(Baseline):
         count, loop = 0, True
         while loop and count < 5:
             count += 1
+            loop = False
             routes, theta, _ = self.master_problem()
             for route in routes:
-                loop = loop and (self.pricing_problem(route, theta) > 0)
+                loop = loop and (self.pricing_problem(route, theta) > 0) or loop
         self.get_solution()
         return self.solution, self.cost
