@@ -1,0 +1,41 @@
+# Python cache and build output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor and local machine metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime, logs, and temporary files
+*.log
+*.tmp
+Q*.tmp
+*.bak
+*.swp
+
+# Generated datasets, maps, figures, and experiment outputs
+datasets/
+results/
+*.npz
+*.pkl
+*.graphml
+*.pdf
+*.png
+*.html
