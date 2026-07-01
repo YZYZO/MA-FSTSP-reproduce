@@ -16,12 +16,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import logging
+import json
+import time
 from pathlib import Path
 from functools import lru_cache
+from html import escape
 from matplotlib.patches import Circle
 from shapely.geometry import MultiPoint
 from src.fstsp import MultiAgentFlyingSidekickTSP
-from problem import cambridge, manhattan, _pairwise_distance
+from problem import (
+    cambridge,
+    manhattan,
+    _pairwise_distance,
+    multiagent_instance_on_cambridge,
+    multiagent_instance_on_manhattan,
+)
 from utils import haversine
 from config import DEMO_DRONE_LIMIT, ensure_dir, result_path
 
@@ -55,6 +64,52 @@ ARTIFACTS = {
     'plot_cities': (MANHATTAN_DATA_DIR / 'city-time.npy',),
     'plot_rates': (MANHATTAN_DATA_DIR / 'rates-time.npy',),
     'plot_depots': (MANHATTAN_DATA_DIR / 'depots-time.npy',),
+}
+
+# Large road-network solution-map settings. Edit these values directly when you
+# want to inspect another result directory, customer size, instance, or fleet
+# configuration.
+LARGE_ROAD_RESULT_ROOT = result_path()
+LARGE_ROAD_OUTPUT_ROOT = result_path()
+LARGE_ROAD_CITIES = ('manhattan', 'boston')
+LARGE_ROAD_CUSTOMER_COUNT = 100
+LARGE_ROAD_INSTANCE_INDEX = 0
+LARGE_ROAD_NUM_INSTANCES = 100
+LARGE_ROAD_LIMIT = 1.5
+LARGE_ROAD_SPEED = 1.6
+LARGE_ROAD_THETA = (0.5, 0.5)
+LARGE_ROAD_DRAW_ROAD_EDGES = False
+LARGE_ROAD_MAX_DRAW_EDGES = 10000
+LARGE_ROAD_DEPOT_RADIUS = 7
+LARGE_ROAD_CUSTOMER_RADIUS = 4
+LARGE_ROAD_ROUTE_WEIGHT = 4
+LARGE_ROAD_DRONE_WEIGHT = 3
+LARGE_ROAD_DRONE_COLOR = '#111827'
+LARGE_ROAD_TRUCK_OPACITY = 0.95
+LARGE_ROAD_DRONE_OPACITY = 0.85
+LARGE_ROAD_COLORS = (
+    '#1f77b4', '#d62728', '#9467bd', '#ff7f0e', '#17becf',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#0f4c81',
+)
+LARGE_ROAD_CITY_CONFIGS = {
+    'manhattan': {
+        'label': 'Manhattan',
+        'result_subdir': 'manhattan',
+        'instance_builder': 'manhattan',
+        'num_depots': 5,
+        'drones_per_truck': 1,
+    },
+    'boston': {
+        'label': 'Boston',
+        'result_subdir': 'boston',
+        'instance_builder': 'boston',
+        'num_depots': 5,
+        'drones_per_truck': 1,
+    },
+}
+LARGE_ROAD_INSTANCE_BUILDERS = {
+    'manhattan': multiagent_instance_on_manhattan,
+    'boston': multiagent_instance_on_cambridge,
 }
 
 
@@ -775,6 +830,820 @@ def _plot_solution_maps(instance, output_dir):
     _save_map(n, output_dir / 'solution.html')
 
 
+def _jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return [_jsonable(item) for item in value.tolist()]
+    if isinstance(value, dict):
+        return {str(_jsonable(key)): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _save_json(path, payload):
+    ensure_dir(path.parent)
+    with path.open('w', encoding='utf-8') as f:
+        json.dump(_jsonable(payload), f, indent=2)
+
+
+def _node_text(nodes, limit=24):
+    nodes = list(nodes)
+    shown = ', '.join(str(_jsonable(node)) for node in nodes[:limit])
+    if len(nodes) > limit:
+        shown += f', ... (+{len(nodes) - limit})'
+    return shown
+
+
+def _html(value):
+    return escape(str(value), quote=True)
+
+
+def _edge_weight(graph, start, end):
+    data = graph.get_edge_data(start, end)
+    if data is None:
+        return 0.0
+    if 'weight' in data:
+        return float(data.get('weight', 0.0))
+    weights = []
+    for item in data.values():
+        if isinstance(item, dict) and 'weight' in item:
+            weights.append(float(item['weight']))
+    return min(weights) if weights else 0.0
+
+
+def _truck_route_metrics(graph, route):
+    route = list(route)
+    if len(route) == 0:
+        return {
+            'key_route': [],
+            'expanded_nodes': [],
+            'locations': [],
+            'segments': [],
+            'distance': 0.0,
+        }
+
+    locations = [_folium_node_location(graph, route[0])]
+    expanded_nodes = [route[0]]
+    segments = []
+    total_distance = 0.0
+    for segment_index, (start, end) in enumerate(zip(route[:-1], route[1:])):
+        if start == end:
+            path = [start]
+            segment_distance = 0.0
+        else:
+            path = nx.dijkstra_path(graph, start, end, weight='weight')
+            segment_distance = sum(_edge_weight(graph, u, v) for u, v in zip(path[:-1], path[1:]))
+        total_distance += segment_distance
+        for node in path[1:]:
+            locations.append(_folium_node_location(graph, node))
+            expanded_nodes.append(node)
+        segments.append({
+            'index': segment_index,
+            'from': start,
+            'to': end,
+            'distance': segment_distance,
+            'path_node_count': len(path),
+            'path_nodes': path,
+        })
+
+    return {
+        'key_route': route,
+        'expanded_nodes': expanded_nodes,
+        'locations': locations,
+        'segments': segments,
+        'distance': total_distance,
+    }
+
+
+def _drone_sortie_metrics(graph, sortie, limit, speed):
+    sortie = list(sortie)
+    distance = sum(
+        haversine(graph.nodes[start]['pos'], graph.nodes[end]['pos'])
+        for start, end in zip(sortie[:-1], sortie[1:])
+    )
+    customer = sortie[1] if len(sortie) >= 3 else None
+    return {
+        'nodes': sortie,
+        'launch': sortie[0] if sortie else None,
+        'customer': customer,
+        'recovery': sortie[-1] if sortie else None,
+        'distance': distance,
+        'flight_time': distance / speed if speed else None,
+        'within_limit': distance <= limit,
+    }
+
+
+def _large_road_route_stats(graph, solution, depot_records, limit, speed):
+    stats = []
+    for depot_index, route in enumerate(solution):
+        record = depot_records[depot_index] if depot_index < len(depot_records) else {}
+        truck_metrics = _truck_route_metrics(graph, route.get('truck', []))
+        drone_metrics = [
+            _drone_sortie_metrics(graph, sortie, limit, speed)
+            for sortie in _iter_drone_sorties(route)
+        ]
+        stats.append({
+            'depot_index': depot_index,
+            'depot_node': record.get('depot_node'),
+            'customer_count': record.get('customer_count', 0),
+            'truck': {
+                'key_route': truck_metrics['key_route'],
+                'distance': truck_metrics['distance'],
+                'stop_count': len(truck_metrics['key_route']),
+                'expanded_node_count': len(truck_metrics['expanded_nodes']),
+                'segments': truck_metrics['segments'],
+            },
+            'drone': {
+                'sortie_count': len(drone_metrics),
+                'total_distance': sum(item['distance'] for item in drone_metrics),
+                'sorties': drone_metrics,
+            },
+        })
+    return stats
+
+
+def _solve_large_road_with_telemetry(model):
+    total_start = time.perf_counter()
+    telemetry = {
+        'timings': {},
+        'depot_records': [],
+    }
+    model.solution = []
+    model.cost = 0
+
+    start = time.perf_counter()
+    convex_sets = model.get_boundary_convex_sets(model.theta[0])
+    telemetry['timings']['boundary_convex_sets_seconds'] = time.perf_counter() - start
+
+    start = time.perf_counter()
+    model.set_mst(convex_sets)
+    telemetry['timings']['mst_partition_seconds'] = time.perf_counter() - start
+
+    for depot_index, depot in enumerate(model.depots):
+        group = list(model.groups[depot])
+        convex_set = [[depot]] + [convex_sets[city] for city in group]
+        record = {
+            'depot_index': depot_index,
+            'depot_node': depot,
+            'customer_count': len(group),
+            'customers': group,
+            'convex_set_sizes': [len(nodes) for nodes in convex_set],
+            'set_tsp_solver': 'none',
+            'set_tsp_sequence': [],
+            'visit_route': [depot, depot],
+            'objective_contribution': 0.0,
+            'timings': {
+                'set_tsp_seconds': 0.0,
+                'local_search_seconds': 0.0,
+            },
+        }
+
+        if len(group) == 0:
+            raw_solution = {'truck': [depot, depot], 'drone': []}
+            converted_solution = model.convert(raw_solution)
+        else:
+            record['set_tsp_solver'] = 'LKH' if model.theta[1] == 0 else 'Set-TSP'
+            start = time.perf_counter()
+            seq = model.get_seq(depot, convex_set)
+            record['timings']['set_tsp_seconds'] = time.perf_counter() - start
+            visit_route = [depot] + [group[i - 1] for i in seq[1:-1]] + [depot]
+            record['set_tsp_sequence'] = seq
+            record['visit_route'] = visit_route
+
+            start = time.perf_counter()
+            raw_solution, cost = model.local_search_multi_drone_appr(visit_route, depot)
+            record['timings']['local_search_seconds'] = time.perf_counter() - start
+            record['objective_contribution'] = cost
+            model.cost += cost
+            converted_solution = model.convert(raw_solution)
+
+        model.solution.append(converted_solution)
+        telemetry['depot_records'].append(record)
+
+    telemetry['timings']['solve_seconds'] = time.perf_counter() - total_start
+    telemetry['objective_value'] = model.cost
+    return model.solution, model.cost, telemetry
+
+
+def _build_large_road_summary(
+    graph,
+    depots,
+    cities,
+    config,
+    result_file,
+    output_path,
+    summary_path,
+    city_label,
+    customer_count,
+    instance_index,
+    num_instances,
+    saved_result,
+    solved_cost,
+    telemetry,
+    route_stats,
+):
+    groups = [
+        {
+            'depot_index': record['depot_index'],
+            'depot_node': record['depot_node'],
+            'customer_count': record['customer_count'],
+            'customers': record['customers'],
+        }
+        for record in telemetry['depot_records']
+    ]
+    return {
+        'city': city_label,
+        'input': {
+            'customer_count': customer_count,
+            'instance_index': instance_index,
+            'num_instances': num_instances,
+            'num_depots': config['num_depots'],
+            'drones_per_truck': config.get('drones_per_truck'),
+            'limit': config.get('limit', LARGE_ROAD_LIMIT),
+            'speed': config.get('speed', LARGE_ROAD_SPEED),
+            'theta': config.get('theta', LARGE_ROAD_THETA),
+            'depots': list(depots),
+            'customers': list(cities),
+        },
+        'files': {
+            'result_file': result_file,
+            'output_html': output_path,
+            'summary_json': summary_path,
+        },
+        'graph': {
+            'nodes': graph.number_of_nodes(),
+            'edges': graph.number_of_edges(),
+        },
+        'results': {
+            'objective_value': solved_cost,
+            'saved_cost': saved_result.get('cost') if saved_result else None,
+            'saved_time': saved_result.get('time') if saved_result else None,
+            'solve_seconds': telemetry['timings']['solve_seconds'],
+        },
+        'groups': groups,
+        'set_tsp': telemetry['depot_records'],
+        'route_stats': route_stats,
+        'timings': telemetry['timings'],
+    }
+
+
+def _summary_number(value, digits=3):
+    if value is None:
+        return 'n/a'
+    return f'{float(value):.{digits}f}'
+
+
+def _render_large_road_sidebar(summary):
+    input_data = summary['input']
+    results = summary['results']
+    graph = summary['graph']
+    files = summary['files']
+    route_stats = summary['route_stats']
+    group_rows = []
+    for group in summary['groups']:
+        group_rows.append(
+            '<details class="ma-details">'
+            f"<summary>Depot {group['depot_index']} node {group['depot_node']} "
+            f"({group['customer_count']} customers)</summary>"
+            f"<div class=\"ma-list\">{_html(_node_text(group['customers'], limit=60))}</div>"
+            '</details>'
+        )
+
+    set_tsp_rows = []
+    for record in summary['set_tsp']:
+        set_tsp_rows.append(
+            '<details class="ma-details">'
+            f"<summary>Depot {record['depot_index']} - {record['set_tsp_solver']} "
+            f"({_summary_number(record['timings']['set_tsp_seconds'])}s)</summary>"
+            f"<div>Customers: {record['customer_count']}</div>"
+            f"<div>Objective part: {_summary_number(record['objective_contribution'], 6)}</div>"
+            f"<div>Sequence: {_html(_node_text(record['set_tsp_sequence'], limit=80))}</div>"
+            f"<div>Visit route: {_html(_node_text(record['visit_route'], limit=80))}</div>"
+            '</details>'
+        )
+
+    route_rows = []
+    for stat in route_stats:
+        route_rows.append(
+            '<details class="ma-details">'
+            f"<summary>Depot {stat['depot_index']} routes</summary>"
+            f"<div>Truck distance: {_summary_number(stat['truck']['distance'], 6)}</div>"
+            f"<div>Truck stops: {stat['truck']['stop_count']}</div>"
+            f"<div>Drone sorties: {stat['drone']['sortie_count']}</div>"
+            f"<div>Drone total distance: {_summary_number(stat['drone']['total_distance'], 6)}</div>"
+            '</details>'
+        )
+
+    legend = (
+        '<div class="ma-legend-row"><span class="ma-line ma-truck"></span> Truck route: solid, depot color</div>'
+        '<div class="ma-legend-row"><span class="ma-line ma-drone"></span> Drone sortie: dark dashed line</div>'
+        '<div class="ma-legend-row"><span class="ma-dot ma-depot"></span> Depot</div>'
+        '<div class="ma-legend-row"><span class="ma-dot ma-customer"></span> Customer</div>'
+    )
+
+    return f"""
+    <style>
+      .ma-sidebar {{
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        bottom: 12px;
+        width: 380px;
+        z-index: 9999;
+        overflow: auto;
+        background: rgba(255, 255, 255, 0.96);
+        border: 1px solid #cbd5e1;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
+        border-radius: 6px;
+        padding: 12px 14px;
+        color: #111827;
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        line-height: 1.42;
+      }}
+      .ma-sidebar h2 {{
+        margin: 0 0 8px 0;
+        font-size: 16px;
+      }}
+      .ma-sidebar h3 {{
+        margin: 12px 0 6px 0;
+        font-size: 13px;
+        border-bottom: 1px solid #e5e7eb;
+        padding-bottom: 3px;
+      }}
+      .ma-kv {{
+        display: grid;
+        grid-template-columns: 132px 1fr;
+        gap: 3px 8px;
+      }}
+      .ma-key {{
+        color: #475569;
+      }}
+      .ma-value {{
+        overflow-wrap: anywhere;
+      }}
+      .ma-details {{
+        margin: 4px 0;
+        padding: 4px 0;
+        border-bottom: 1px solid #f1f5f9;
+      }}
+      .ma-details summary {{
+        cursor: pointer;
+        font-weight: 600;
+      }}
+      .ma-list {{
+        margin-top: 3px;
+        color: #334155;
+        overflow-wrap: anywhere;
+      }}
+      .ma-line {{
+        display: inline-block;
+        width: 30px;
+        height: 0;
+        margin-right: 6px;
+        vertical-align: middle;
+      }}
+      .ma-truck {{
+        border-top: 4px solid #1f77b4;
+      }}
+      .ma-drone {{
+        border-top: 3px dashed {LARGE_ROAD_DRONE_COLOR};
+      }}
+      .ma-dot {{
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        margin-right: 8px;
+        border-radius: 50%;
+        vertical-align: middle;
+      }}
+      .ma-depot {{
+        background: #1f77b4;
+      }}
+      .ma-customer {{
+        background: #ffffff;
+        border: 2px solid #1f77b4;
+      }}
+    </style>
+    <div class="ma-sidebar">
+      <h2>{_html(summary['city'])} Run Details</h2>
+      <h3>Legend</h3>
+      {legend}
+      <h3>Inputs</h3>
+      <div class="ma-kv">
+        <div class="ma-key">Customers</div><div class="ma-value">{input_data['customer_count']}</div>
+        <div class="ma-key">Instance</div><div class="ma-value">{input_data['instance_index']} / {input_data['num_instances'] - 1}</div>
+        <div class="ma-key">Depots</div><div class="ma-value">{input_data['num_depots']}</div>
+        <div class="ma-key">Drones/truck</div><div class="ma-value">{input_data['drones_per_truck']}</div>
+        <div class="ma-key">Limit</div><div class="ma-value">{input_data['limit']}</div>
+        <div class="ma-key">Speed</div><div class="ma-value">{input_data['speed']}</div>
+        <div class="ma-key">Theta</div><div class="ma-value">{_html(input_data['theta'])}</div>
+        <div class="ma-key">Depot nodes</div><div class="ma-value">{_html(_node_text(input_data['depots'], limit=40))}</div>
+        <div class="ma-key">Customer nodes</div><div class="ma-value">{_html(_node_text(input_data['customers'], limit=60))}</div>
+      </div>
+      <h3>Files</h3>
+      <div class="ma-kv">
+        <div class="ma-key">Result npz</div><div class="ma-value">{_html(files['result_file'])}</div>
+        <div class="ma-key">HTML output</div><div class="ma-value">{_html(files['output_html'])}</div>
+        <div class="ma-key">Summary JSON</div><div class="ma-value">{_html(files['summary_json'])}</div>
+      </div>
+      <h3>Results</h3>
+      <div class="ma-kv">
+        <div class="ma-key">Objective</div><div class="ma-value">{_summary_number(results['objective_value'], 6)}</div>
+        <div class="ma-key">Saved cost</div><div class="ma-value">{_summary_number(results['saved_cost'], 6)}</div>
+        <div class="ma-key">Saved time</div><div class="ma-value">{_summary_number(results['saved_time'])}s</div>
+        <div class="ma-key">Solve time</div><div class="ma-value">{_summary_number(results['solve_seconds'])}s</div>
+        <div class="ma-key">Road nodes</div><div class="ma-value">{graph['nodes']}</div>
+        <div class="ma-key">Road edges</div><div class="ma-value">{graph['edges']}</div>
+      </div>
+      <h3>Customer Groups</h3>
+      {''.join(group_rows)}
+      <h3>Set-TSP / Order</h3>
+      {''.join(set_tsp_rows)}
+      <h3>Route Stats</h3>
+      {''.join(route_rows)}
+    </div>
+    """
+
+
+def _line_popup(title, rows):
+    body = ''.join(
+        f'<tr><th style="text-align:left;padding:2px 8px 2px 0">{_html(key)}</th>'
+        f'<td style="padding:2px 0">{_html(value)}</td></tr>'
+        for key, value in rows
+    )
+    return folium.Popup(f'<b>{_html(title)}</b><table>{body}</table>', max_width=520)
+
+
+def _large_road_result_file(result_root, city_key, config, customer_count):
+    if config.get('result_file'):
+        return Path(config['result_file'])
+    return Path(result_root) / config.get('result_subdir', city_key) / 'data' / f'road-size-{customer_count}.npz'
+
+
+def _large_road_output_dir(output_root, city_key, config):
+    if config.get('output_dir'):
+        return Path(config['output_dir'])
+    return Path(output_root) / config.get('result_subdir', city_key) / 'maps'
+
+
+def _load_large_road_saved_result(result_file, instance_index):
+    data = np.load(result_file, allow_pickle=True)
+    try:
+        if 'stsp_cost' not in data.files:
+            print(f"Skipping {result_file}: missing 'stsp_cost'.")
+            return None, 0
+        costs = np.asarray(data['stsp_cost']).reshape(-1)
+        if instance_index >= len(costs):
+            print(
+                f'Skipping {result_file}: instance_index={instance_index} '
+                f'is outside saved result count {len(costs)}.'
+            )
+            return None, len(costs)
+        saved = {'cost': float(costs[instance_index])}
+        if 'stsp_time' in data.files:
+            times = np.asarray(data['stsp_time']).reshape(-1)
+            if instance_index < len(times):
+                saved['time'] = float(times[instance_index])
+        return saved, len(costs)
+    finally:
+        data.close()
+
+
+def _folium_graph_center_and_bounds(graph):
+    lons = [graph.nodes[node]['pos'][0] for node in graph.nodes]
+    lats = [graph.nodes[node]['pos'][1] for node in graph.nodes]
+    center = [float(np.mean(lats)), float(np.mean(lons))]
+    bounds = [[min(lats), min(lons)], [max(lats), max(lons)]]
+    return center, bounds
+
+
+def _folium_node_location(graph, node):
+    return [graph.nodes[node]['pos'][1], graph.nodes[node]['pos'][0]]
+
+
+def _iter_drone_sorties(route):
+    for drone_routes in route.get('drone', []):
+        if len(drone_routes) == 0:
+            continue
+        first = drone_routes[0]
+        if isinstance(first, (list, tuple, np.ndarray)):
+            for sortie in drone_routes:
+                if len(sortie) >= 2:
+                    yield list(sortie)
+        elif len(drone_routes) >= 2:
+            yield list(drone_routes)
+
+
+def _draw_large_road_edges(map_obj, graph):
+    road_layer = folium.FeatureGroup(name='Road network', show=False)
+    for edge in graph.edges:
+        start, end = edge[:2]
+        folium.PolyLine(
+            locations=[_folium_node_location(graph, start), _folium_node_location(graph, end)],
+            color='#222222',
+            weight=1,
+            opacity=0.28,
+        ).add_to(road_layer)
+    road_layer.add_to(map_obj)
+
+
+def _plot_large_road_solution_map(
+    graph,
+    depots,
+    cities,
+    groups,
+    solution,
+    output_path,
+    summary,
+    draw_road_edges,
+):
+    city_label = summary['city']
+    center, bounds = _folium_graph_center_and_bounds(graph)
+    map_obj = folium.Map(location=center, zoom_start=13, tiles='Cartodb Positron')
+
+    if draw_road_edges and graph.number_of_edges() <= LARGE_ROAD_MAX_DRAW_EDGES:
+        _draw_large_road_edges(map_obj, graph)
+    elif draw_road_edges:
+        print(
+            f'Skipping road-edge layer for {city_label}: '
+            f'{graph.number_of_edges()} edges exceed LARGE_ROAD_MAX_DRAW_EDGES={LARGE_ROAD_MAX_DRAW_EDGES}.'
+        )
+
+    assigned_customers = set()
+    for depot_index, depot in enumerate(depots):
+        color = LARGE_ROAD_COLORS[depot_index % len(LARGE_ROAD_COLORS)]
+        layer = folium.FeatureGroup(name=f'{city_label} depot {depot_index}', show=True)
+        depot_location = _folium_node_location(graph, depot)
+        folium.CircleMarker(
+            location=depot_location,
+            radius=LARGE_ROAD_DEPOT_RADIUS,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.95,
+            tooltip=f'Depot {depot_index}: node {depot}',
+            popup=f'Depot {depot_index}<br>Node: {depot}<br>Assigned customers: {len(groups.get(depot, []))}',
+        ).add_to(layer)
+
+        for city in groups.get(depot, []):
+            assigned_customers.add(city)
+            folium.CircleMarker(
+                location=_folium_node_location(graph, city),
+                radius=LARGE_ROAD_CUSTOMER_RADIUS,
+                color=color,
+                weight=1,
+                fill=True,
+                fill_color='white',
+                fill_opacity=0.9,
+                tooltip=f'Depot {depot_index} customer: node {city}',
+                popup=f'Customer node: {city}<br>Assigned depot: {depot_index}',
+            ).add_to(layer)
+
+        if depot_index < len(solution):
+            route = solution[depot_index]
+            truck_route = route.get('truck', [])
+            if len(truck_route) >= 2:
+                truck_metrics = _truck_route_metrics(graph, truck_route)
+                if len(truck_metrics['locations']) >= 2:
+                    tooltip = (
+                        f"<b>Truck route</b><br>"
+                        f"Depot {depot_index} node {depot}<br>"
+                        f"Distance: {truck_metrics['distance']:.6f}<br>"
+                        f"Stops: {len(truck_route)}<br>"
+                        f"Assigned customers: {len(groups.get(depot, []))}"
+                    )
+                    popup = _line_popup(
+                        f'Depot {depot_index} truck route',
+                        [
+                            ('type', 'truck'),
+                            ('depot node', depot),
+                            ('key route', _node_text(truck_route, limit=120)),
+                            ('expanded nodes', truck_metrics['expanded_node_count']
+                             if 'expanded_node_count' in truck_metrics else len(truck_metrics['expanded_nodes'])),
+                            ('distance', f"{truck_metrics['distance']:.6f}"),
+                            ('segments', len(truck_metrics['segments'])),
+                        ],
+                    )
+                    folium.PolyLine(
+                        locations=truck_metrics['locations'],
+                        color=color,
+                        weight=LARGE_ROAD_ROUTE_WEIGHT,
+                        opacity=LARGE_ROAD_TRUCK_OPACITY,
+                        tooltip=folium.Tooltip(tooltip, sticky=True),
+                        popup=popup,
+                    ).add_to(layer)
+            for sortie in _iter_drone_sorties(route):
+                drone_metrics = _drone_sortie_metrics(
+                    graph,
+                    sortie,
+                    summary['input']['limit'],
+                    summary['input']['speed'],
+                )
+                status = 'within limit' if drone_metrics['within_limit'] else 'exceeds limit'
+                tooltip = (
+                    f"<b>Drone sortie</b><br>"
+                    f"Depot {depot_index} node {depot}<br>"
+                    f"Launch: {drone_metrics['launch']}<br>"
+                    f"Customer: {drone_metrics['customer']}<br>"
+                    f"Recovery: {drone_metrics['recovery']}<br>"
+                    f"Distance: {drone_metrics['distance']:.6f}<br>"
+                    f"{status}"
+                )
+                popup = _line_popup(
+                    f'Depot {depot_index} drone sortie',
+                    [
+                        ('type', 'drone'),
+                        ('depot node', depot),
+                        ('nodes', _node_text(drone_metrics['nodes'], limit=20)),
+                        ('launch', drone_metrics['launch']),
+                        ('customer', drone_metrics['customer']),
+                        ('recovery', drone_metrics['recovery']),
+                        ('distance', f"{drone_metrics['distance']:.6f}"),
+                        ('flight time', _summary_number(drone_metrics['flight_time'], 6)),
+                        ('limit', summary['input']['limit']),
+                        ('status', status),
+                    ],
+                )
+                folium.PolyLine(
+                    locations=[_folium_node_location(graph, node) for node in sortie],
+                    color=LARGE_ROAD_DRONE_COLOR,
+                    weight=LARGE_ROAD_DRONE_WEIGHT,
+                    opacity=LARGE_ROAD_DRONE_OPACITY,
+                    dash_array='8, 6',
+                    tooltip=folium.Tooltip(tooltip, sticky=True),
+                    popup=popup,
+                ).add_to(layer)
+
+        layer.add_to(map_obj)
+
+    unassigned = [city for city in cities if city not in assigned_customers]
+    if unassigned:
+        layer = folium.FeatureGroup(name=f'{city_label} unassigned customers', show=True)
+        for city in unassigned:
+            folium.CircleMarker(
+                location=_folium_node_location(graph, city),
+                radius=LARGE_ROAD_CUSTOMER_RADIUS,
+                color='#444444',
+                weight=1,
+                fill=True,
+                fill_color='#dddddd',
+                fill_opacity=0.9,
+                tooltip=f'Unassigned customer: node {city}',
+                popup=f'Unassigned customer node: {city}',
+            ).add_to(layer)
+        layer.add_to(map_obj)
+
+    map_obj.get_root().html.add_child(folium.Element(_render_large_road_sidebar(summary)))
+    folium.LayerControl(position='topleft', collapsed=False).add_to(map_obj)
+    map_obj.fit_bounds(bounds)
+    _save_map(map_obj, output_path)
+
+
+def plot_large_road_experiment_results(
+    result_root=None,
+    output_root=None,
+    city_configs=None,
+    cities=None,
+    customer_count=None,
+    instance_index=None,
+    num_instances=None,
+    draw_road_edges=None,
+):
+    """
+    Visualize large Manhattan/Boston road-network experiment results.
+
+    The saved .npz files contain only cost/time arrays, so this function
+    rebuilds the same deterministic experiment instance and solves the selected
+    instance again to recover the truck/drone routes for mapping.
+    """
+    result_root = LARGE_ROAD_RESULT_ROOT if result_root is None else Path(result_root)
+    output_root = LARGE_ROAD_OUTPUT_ROOT if output_root is None else Path(output_root)
+    city_configs = LARGE_ROAD_CITY_CONFIGS if city_configs is None else city_configs
+    cities = LARGE_ROAD_CITIES if cities is None else cities
+    customer_count = LARGE_ROAD_CUSTOMER_COUNT if customer_count is None else customer_count
+    instance_index = LARGE_ROAD_INSTANCE_INDEX if instance_index is None else instance_index
+    num_instances = LARGE_ROAD_NUM_INSTANCES if num_instances is None else num_instances
+    draw_road_edges = LARGE_ROAD_DRAW_ROAD_EDGES if draw_road_edges is None else draw_road_edges
+
+    generated = {}
+    for city_key in cities:
+        if city_key not in city_configs:
+            print(f'Skipping unknown large-road city config: {city_key}')
+            continue
+
+        config = city_configs[city_key]
+        local_customer_count = config.get('customer_count', customer_count)
+        local_instance_index = config.get('instance_index', instance_index)
+        local_num_instances = max(config.get('num_instances', num_instances), local_instance_index + 1)
+        local_num_depots = config['num_depots']
+        default_drones = LARGE_ROAD_CITY_CONFIGS.get(city_key, {}).get('drones_per_truck', 3)
+        local_drones = config.get('drones_per_truck', default_drones)
+        local_limit = config.get('limit', LARGE_ROAD_LIMIT)
+        local_speed = config.get('speed', LARGE_ROAD_SPEED)
+        local_theta = config.get('theta', LARGE_ROAD_THETA)
+        city_label = config.get('label', city_key.title())
+
+        result_file = _large_road_result_file(result_root, city_key, config, local_customer_count)
+        if not _require_files(result_file):
+            continue
+
+        saved_result, saved_count = _load_large_road_saved_result(result_file, local_instance_index)
+        if saved_result is None and saved_count == 0:
+            continue
+        if saved_count and local_instance_index >= saved_count:
+            continue
+
+        builder_key = config.get('instance_builder', city_key)
+        if builder_key not in LARGE_ROAD_INSTANCE_BUILDERS:
+            print(f'Skipping {city_label}: unknown instance_builder={builder_key}.')
+            continue
+        builder = LARGE_ROAD_INSTANCE_BUILDERS[builder_key]
+        print(
+            f'Building {city_label} instance {local_instance_index}: '
+            f'depots={local_num_depots}, customers={local_customer_count}, drones={local_drones}.'
+        )
+        graph, depots, city_nodes, distance = builder(local_num_instances, local_num_depots, local_customer_count)
+        selected_depots = depots[local_instance_index]
+        selected_cities = city_nodes[local_instance_index]
+
+        model = MultiAgentFlyingSidekickTSP(
+            graph,
+            selected_depots,
+            selected_cities,
+            distance,
+            local_drones,
+            limit=local_limit,
+            speed=local_speed,
+            theta=local_theta,
+        )
+        solution, solved_cost, telemetry = _solve_large_road_with_telemetry(model)
+
+        output_dir = _large_road_output_dir(output_root, city_key, config)
+        output_path = output_dir / f'road-size-{local_customer_count}-instance-{local_instance_index:03d}-solution.html'
+        summary_path = output_dir / f'road-size-{local_customer_count}-instance-{local_instance_index:03d}-summary.json'
+        route_stats = _large_road_route_stats(
+            graph,
+            solution,
+            telemetry['depot_records'],
+            local_limit,
+            local_speed,
+        )
+        summary_config = {
+            **config,
+            'limit': local_limit,
+            'speed': local_speed,
+            'theta': local_theta,
+            'drones_per_truck': local_drones,
+        }
+        summary = _build_large_road_summary(
+            graph,
+            selected_depots,
+            selected_cities,
+            summary_config,
+            result_file,
+            output_path,
+            summary_path,
+            city_label,
+            local_customer_count,
+            local_instance_index,
+            local_num_instances,
+            saved_result,
+            solved_cost,
+            telemetry,
+            route_stats,
+        )
+        _save_json(summary_path, summary)
+        _plot_large_road_solution_map(
+            graph,
+            selected_depots,
+            selected_cities,
+            model.groups,
+            solution,
+            output_path,
+            summary,
+            config.get('draw_road_edges', draw_road_edges),
+        )
+        print(f'Saved {city_label} large-road map to {output_path}')
+        print(f'Saved {city_label} large-road summary to {summary_path}')
+        generated[city_key] = {
+            'map': output_path,
+            'summary': summary_path,
+            'result_file': result_file,
+            'solved_cost': solved_cost,
+            'saved_cost': saved_result.get('cost') if saved_result else None,
+            'saved_time': saved_result.get('time') if saved_result else None,
+        }
+
+    return generated
+
+
 def plot_paper_demo():
     """
     使用 Manhattan 与 Boston 子图生成论文风格三阶段示意图。
@@ -792,12 +1661,13 @@ def plot_example():
 
 
 if __name__ == '__main__':
-    plot_speed()
-    plot_k()
-    plot_cities()
-    plot_rates()
-    plot_depots()
-    plot_r()
-    plot_accelerate()
-    plot_paper_demo()
+    # plot_speed()
+    # plot_k()
+    # plot_cities()
+    # plot_rates()
+    # plot_depots()
+    # plot_r()
+    # plot_accelerate()
+    # plot_paper_demo()
     plot_example()
+    plot_large_road_experiment_results
