@@ -8,8 +8,6 @@
 4. 调用 `src/` 目录中的多种算法，并将成本与耗时保存为 `.npy` 文件。
 """
 
-# 导入 `networkx`，用于图最短路和全对最短路计算。
-import networkx as nx
 # 导入 `sys`，保留给潜在的命令行扩展使用。
 import sys
 # 导入 LRMP 基线算法。
@@ -28,8 +26,8 @@ import numpy as np
 import time
 # 导入进度条工具 `tqdm`。
 from tqdm import tqdm
-# 导入球面距离函数，用于构造无人机欧氏/球面距离矩阵。
-from utils import haversine
+# 导入统一距离工厂，规模实验禁止再构造全对嵌套字典。
+from distance_oracle import build_distance_provider
 from config import RUN_FULL_EXPERIMENTS, ensure_dir, result_path
 
 # 导入 `os`，用于读取/设置 CPU 亲和性。
@@ -56,7 +54,7 @@ def _save_npz(path, **arrays):
 
     
 # 固定使用 10 个进程并行运行实例。
-PROCESS_WORKERS = 50
+PROCESS_WORKERS = 1
 # 默认把这 10 个进程限制在当前允许 CPU 集合中的前 10 个逻辑 CPU 上。
 # 如果只想限制进程数、不想绑定 CPU，可改为 False。
 PIN_TO_PROCESS_CORES = True
@@ -757,10 +755,12 @@ def scale_cities():
     print('studying the scalability of fix depot case')
     # 读取 Manhattan 路网。
     graph = manhattan()
-    # 构造卡车和无人机距离矩阵。
-    distance = {'truck': dict(nx.all_pairs_dijkstra_path_length(graph, weight='weight')),
-                'drone': {i: {j: haversine(graph.nodes[i]['pos'], graph.nodes[j]['pos']) for j in graph.nodes}
-                          for i in graph.nodes}}
+    # 三类规模实验共享同一图哈希 H2H 缓存，无人机距离保持按需计算。
+    distance = build_distance_provider(
+        graph,
+        dataset_name=graph.graph.get('dataset_name', 'nyc'),
+        graph_path=graph.graph.get('source_path'),
+    )
     # 初始化成本和耗时容器。
     costs, times = [], []
     # 枚举客户数量。
@@ -809,10 +809,12 @@ def scale_rates():
     print('studying the scalability of fix rates case')
     # 读取 Manhattan 路网。
     graph = manhattan()
-    # 构造卡车和无人机距离矩阵。
-    distance = {'truck': dict(nx.all_pairs_dijkstra_path_length(graph, weight='weight')),
-                'drone': {i: {j: haversine(graph.nodes[i]['pos'], graph.nodes[j]['pos']) for j in graph.nodes}
-                          for i in graph.nodes}}
+    # 使用与其他规模实验相同的数据集名，确保只构建一份版本化索引。
+    distance = build_distance_provider(
+        graph,
+        dataset_name=graph.graph.get('dataset_name', 'nyc'),
+        graph_path=graph.graph.get('source_path'),
+    )
     # 初始化成本和耗时容器。
     costs, times = [], []
     # 枚举仓库数。
@@ -861,10 +863,12 @@ def scale_depots():
     print('studying the scalability of fix cities case')
     # 读取 Manhattan 路网。
     graph = manhattan()
-    # 构造卡车和无人机距离矩阵。
-    distance = {'truck': dict(nx.all_pairs_dijkstra_path_length(graph, weight='weight')),
-                'drone': {i: {j: haversine(graph.nodes[i]['pos'], graph.nodes[j]['pos']) for j in graph.nodes}
-                          for i in graph.nodes}}
+    # 距离工厂命中前两类实验的 H2H 缓存，不再按实验重复物化矩阵。
+    distance = build_distance_provider(
+        graph,
+        dataset_name=graph.graph.get('dataset_name', 'nyc'),
+        graph_path=graph.graph.get('source_path'),
+    )
     # 初始化成本和耗时容器。
     costs, times = [], []
     # 枚举仓库数量。
@@ -953,23 +957,23 @@ def run_full_experiments():
     #     test_small_instance(100, size)
     # 枚举大规模路网实验中的客户数量。
     #for size in [50, 100, 150]:
-    size = 150
+    size = 20
         # 运行 Manhattan 实验。
-    test_manhattan(100, size)
+    test_manhattan(1, size)
         # 运行 Cambridge 实验。
-    test_cambridge(100, size)
-    # 运行距离上限消融实验。
-    ablation_r()
-    # 运行速度消融实验。
-    ablation_speed()
-    # 运行无人机数量消融实验。
-    ablation_k()
-    # 运行固定仓库规模的可扩展性实验。
-    scale_cities()
-    # 运行固定比例的可扩展性实验。
-    scale_rates()
-    # 运行固定客户规模的可扩展性实验。
-    scale_depots()
+    test_cambridge(1, size)
+    # # 运行距离上限消融实验。
+    # ablation_r()
+    # # 运行速度消融实验。
+    # ablation_speed()
+    # # 运行无人机数量消融实验。
+    # ablation_k()
+    # # 运行固定仓库规模的可扩展性实验。
+    # scale_cities()
+    # # 运行固定比例的可扩展性实验。
+    # scale_rates()
+    # # 运行固定客户规模的可扩展性实验。
+    # scale_depots()
 
 
 if __name__ == '__main__':

@@ -56,26 +56,56 @@ pip install -r requirements.txt
 - `nyc.graphml`
 - `cambridge.graphml`（可选）
 
-但当前仓库已经做了离线兼容：
+地图现在使用 `config.py` 中的显式路径：
 
-- 如果缺少 `nyc.graphml`，程序会自动构造一个 **Manhattan 风格网格图**。
-- 如果缺少 `cambridge.graphml`，程序会自动构造一个 **Cambridge 风格网格图**。
-- 若允许联网，也可以让 `osmnx` 自动下载 Cambridge/Boston 路网。
+- `MANHATTAN_GRAPH_PATH = datasets/nyc.graphml`：论文目标 55k 图；本机默认硬性禁止读取、构建和求解。
+- `MANHATTAN_BASELINE_GRAPH_PATH = datasets/manhatten.graphml`：4,333 节点标准化基线，仅用于本机小实例。
+- `BOSTON_GRAPH_PATH = datasets/boston.graphml`：标准化后为 8,313 节点。
 
-缓存文件会自动生成到 `datasets/` 目录下，例如：
+缺失文件默认直接报出完整路径，不会静默换用另一张地图、联网下载或生成合成图；这些行为只能通过独立配置显式开启。旧 `manhattan.json` 和 `cambridge_all_pair_road_distance.pkl` 不再加载、写入或自动删除。
 
-- `datasets/manhattan.json`
-- `datasets/cambridge_all_pair_road_distance.pkl`
+## H2H 原生距离后端
+
+先执行一次 Release 编译：
+
+```powershell
+D:\Anaconda3\envs\MA-FSTSP\python.exe scripts\build_h2h_native.py --release
+```
+
+小图由 `DISTANCE_BACKEND=auto` 使用 eager 基线；超过 `EAGER_DISTANCE_MAX_NODES` 后使用 H2H。索引按完整图 SHA-256 缓存到 `datasets/indexes/`，包含 `graph.bin`、`index.bin`、`metadata.json`、`build.log` 和 `READY`。多个进程首次访问同一图时由跨进程锁保证只构建一次。
+
+本机 `H2H_ENABLE_55K=False` 时，选择 `datasets/nyc.graphml` 会在读取文件和启动 builder 前停止。只有约 200 GB RAM 的服务器才应显式改为 `True`；Linux 服务器需用同一脚本重新编译 `.so`。
+
+阶段 6 的本机慢速验收使用独立临时索引，不污染 `datasets/indexes/`：
+
+```powershell
+$env:H2H_RUN_LOCAL_ACCEPTANCE = "1"
+D:\Anaconda3\envs\MA-FSTSP\python.exe -m unittest tests.test_h2h_phase6_acceptance -v
+```
+
+该测试会在 4,333 和 8,313 节点标准化图上各对照 100,000 个有序节点对，并检查三条查询路径吞吐、缓存重载和两个 spawn worker。普通 `unittest discover` 会跳过这三个显式慢速项。
+
+55k 服务器验收不需要永久修改 `config.py`，而由专用脚本要求一次性的明确授权：
+
+```bash
+python scripts/run_h2h_server_acceptance.py \
+  --confirm-server-55k \
+  --compiler g++ \
+  --worker-counts 1,4,8,16 \
+  --customer-counts 20
+```
+
+脚本只允许 Linux，默认要求至少 150 GiB 物理内存；它会重编译 `.so`、构建/加载 55k 索引、完成 200 个源共 100,000 个 Dijkstra 对照、查询吞吐、worker 扩展和 5 仓库/20 客户/3 无人机端到端实例，并原子写入 `results/h2h-server-55k-acceptance.json`。首个实例通过后可用 `--customer-counts 50,100,150` 继续扩展。完整说明见 `docs/H2H_SERVER_ACCEPTANCE.md`。
 
 ## 如何运行实验
 ### 1. 运行轻量级演示实验
-如果你当前没有真实地图数据，直接运行：
+准备好 `MANHATTAN_BASELINE_GRAPH_PATH` 和 `BOSTON_GRAPH_PATH` 后，将 `RUN_FULL_EXPERIMENTS=False` 并运行：
 
 ```bash
 python experiments.py
 ```
 
-此时脚本会自动进入 **轻量 demo 模式**，运行几个小规模可复现的合成实例，确认代码能正常工作。
+此时脚本进入轻量 demo 模式，只在真实基线图上截取小规模子图；缺少显式地图时会直接报错，不会悄悄改用合成地图。
 
 ### 2. 运行论文全量实验
 如果你已经准备好了真实数据，或者明确要跑完整实验，请打开 `config.py`，将：
@@ -121,7 +151,9 @@ python plot.py
 - `ALLOW_OSM_DOWNLOAD`：是否允许用 `osmnx` 下载 Boston/Cambridge 路网。
 - `REFRESH_OSM`：是否强制重新下载 Boston 路网。
 - `OSM_DIST_METERS`：下载中心点周围的半径。
-- `OSM_MAX_NODES`：用于控制真实路网规模，避免全对最短路过慢。
+- `OSM_MAX_NODES`：显式联网刷新 Boston 时允许保留的节点上限。
+- `DISTANCE_BACKEND`：`auto` 在小图使用 eager，较大图使用 H2H。
+- `H2H_ENABLE_55K`：服务器运行 55k NYC 的显式开关，本机必须保持 `False`。
 - `RESULTS_DIR`：实验与绘图输出目录，默认是 `results/`。
 
 ## 结果文件说明
@@ -154,10 +186,11 @@ python plot.py
 - `city-*`、`rates-*`、`depots-*` 对应扩展性实验。
 
 ## 当前仓库额外做过的改动
-为了让代码在本地缺少原始数据时也能顺利运行，当前版本还加入了以下增强：
+当前版本还加入了以下增强：
 
-- 自动生成合成 Manhattan / Cambridge 路网。
-- `experiments.py` 自动区分“论文全量实验”和“离线轻量 demo”。
+- 使用显式地图路径，缺失或选错地图时快速失败。
+- `experiments.py` 由配置区分论文全量实验和本机轻量 demo。
+- 使用 H2H 按需卡车距离和按需无人机距离，避免真实图全对矩阵。
 - `plot.py` 在缺少实验结果文件时自动跳过对应图，而不是报错。
 - `plot.py` 已切换为非交互式后端，适合在终端/服务器环境中运行。
 - 项目参数已集中到 `config.py`。

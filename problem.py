@@ -3,13 +3,11 @@
 
 主要内容：
 1. 读取 Manhattan 与 Cambridge 路网。
-2. 在缺少真实数据时自动生成合成网格路网。
-3. 预计算卡车路网距离与无人机直线距离。
+2. 按显式路径标准化真实路网，并对 55k 本机运行进行硬保护。
+3. 通过统一距离工厂提供 eager/H2H 卡车距离和按需无人机距离。
 4. 生成论文实验所需的小规模、多仓库随机实例。
 """
 
-# 导入 `json`，用于保存 Manhattan 的距离缓存。
-import json
 # 导入 `networkx`，用于图构建与最短路计算。
 import networkx as nx
 # 导入 `numpy`，用于随机采样和数组处理。
@@ -20,15 +18,22 @@ matplotlib.use("Agg")
 
 # 导入 `osmnx`，用于从 OpenStreetMap 下载真实路网。   
 import osmnx as ox
-# 导入 `pickle`，用于缓存 Cambridge 的距离矩阵。
-import pickle
 # 导入 `lru_cache`，避免重复读取大型 GraphML 文件。
 from functools import lru_cache
+# 导入 `Path`，用于显式地图路径解析与错误报告。
+from pathlib import Path
 # 导入球面距离函数，用于根据经纬度构造边权。
 from utils import haversine
+from distance_oracle import build_distance_provider
+from h2h_backend import enforce_local_graph_guard, graph_fingerprint
 from config import (
     ALLOW_OSM_DOWNLOAD,
+    ALLOW_GRAPH_PATH_FALLBACK,
+    ALLOW_SYNTHETIC_GRAPH_FALLBACK,
+    BOSTON_GRAPH_PATH,
     DATASETS_DIR,
+    MANHATTAN_BASELINE_GRAPH_PATH,
+    MANHATTAN_GRAPH_PATH,
     OSM_CENTER_POINT,
     OSM_DIST_METERS,
     OSM_MAX_NODES,
@@ -38,18 +43,15 @@ from config import (
     REFRESH_OSM,
 )
 
-# 定义 Manhattan 缓存文件路径。
+# 旧全对缓存只用于迁移提示，不再读取、写入或自动删除。
 MANHATTAN_CACHE = DATASETS_DIR / 'manhattan.json'
-# 定义 Cambridge 缓存文件路径。
 CAMBRIDGE_CACHE = DATASETS_DIR / 'cambridge_all_pair_road_distance.pkl'
-# 定义 Manhattan 图文件可能出现的位置。优先使用论文示意图对应的曼哈顿子图。
+# 仅当 `ALLOW_GRAPH_PATH_FALLBACK=True` 时才检查以下历史候选路径。
 MANHATTAN_GRAPH_CANDIDATES = (
     PROJECT_ROOT / 'manhatten.graphml',
     DATASETS_DIR / 'manhatten.graphml',
     PROJECT_ROOT / 'manhattan.graphml',
     DATASETS_DIR / 'manhattan.graphml',
-    PROJECT_ROOT / 'nyc.graphml',
-    DATASETS_DIR / 'nyc.graphml',
 )
 # 定义 Cambridge/Boston 图文件可能出现的位置。
 CAMBRIDGE_GRAPH_CANDIDATES = (
@@ -58,7 +60,7 @@ CAMBRIDGE_GRAPH_CANDIDATES = (
     PROJECT_ROOT / 'cambridge.graphml',
     DATASETS_DIR / 'cambridge.graphml',
 )
-BOSTON_GRAPH_CACHE = DATASETS_DIR / 'boston.graphml'
+BOSTON_GRAPH_CACHE = BOSTON_GRAPH_PATH
 
 
 def _coordinate_keys(graph):
@@ -170,33 +172,6 @@ def _download_boston_graph():
             print(f'Failed with {message}')
 
     raise RuntimeError('Could not download Boston road graph.\n' + '\n'.join(errors))
-
-
-def _graph_signature(graph):
-    xs = [round(float(graph.nodes[node]['pos'][0]), 7) for node in graph.nodes]
-    ys = [round(float(graph.nodes[node]['pos'][1]), 7) for node in graph.nodes]
-    return {
-        'nodes': graph.number_of_nodes(),
-        'edges': graph.number_of_edges(),
-        'bounds': (min(xs), max(xs), min(ys), max(ys)),
-    }
-
-
-def _load_pairwise_cache(path, graph):
-    if not path.is_file():
-        return None
-    with path.open('rb') as f:
-        payload = pickle.load(f)
-    if 'truck' in payload and 'drone' in payload:
-        return None
-    if payload.get('signature') == _graph_signature(graph):
-        return payload['distance']
-    return None
-
-
-def _save_pairwise_cache(path, graph, distance):
-    with path.open('wb') as f:
-        pickle.dump({'signature': _graph_signature(graph), 'distance': distance}, f)
 
 
 def _ensure_datasets_dir():
@@ -321,127 +296,162 @@ def _synthetic_grid_graph(rows, cols, origin, step):
     return graph
 
 
-def _pairwise_distance(graph):
+def _distance_provider(graph, dataset_name=None):
     """
-    为给定路网一次性构造卡车与无人机的全对距离矩阵。
+    为已标准化路网构造统一的 eager/H2H 与按需无人机距离提供器。
 
     输入：
     - graph: 路网图。
+    - dataset_name: 缓存目录使用的数据集名称。
 
     输出：
-    - 一个字典：
-      - `truck`: 路网最短路距离。
-      - `drone`: 节点间球面直线距离。
+    - 保持 `distance['truck'][u][v]` / `distance['drone'][u][v]` 的字典。
 
     实现逻辑：
-    1. 用 Dijkstra 计算卡车在路网上的全对最短路。
-    2. 用 `haversine` 计算无人机的节点间直线距离。
+    - 小图由配置选择 eager；更大图构建或加载 H2H，绝不静默回退 Dijkstra。
     """
-    # 返回包含卡车距离和无人机距离的字典。
-    return {'truck': dict(nx.all_pairs_dijkstra_path_length(graph, weight='weight')),
-            'drone': {i: {j: haversine(graph.nodes[i]['pos'], graph.nodes[j]['pos']) for j in graph.nodes}
-                      for i in graph.nodes}}
+    source_path = graph.graph.get('source_path')
+    label = dataset_name or graph.graph.get('dataset_name') or 'road-network'
+    return build_distance_provider(
+        graph,
+        dataset_name=label,
+        graph_path=source_path,
+    )
 
 
-@lru_cache(maxsize=1)
-def manhattan():
+def _pairwise_distance(graph):
     """
-    读取 Manhattan 路网；若缺失真实数据，则生成合成 Manhattan 风格网格图。
+    保留旧私有函数名的兼容别名，但不再承诺或执行全对物化。
+
+    输入：标准化路网图。
+    输出：统一距离提供器。
+    """
+    return _distance_provider(graph)
+
+
+@lru_cache(maxsize=4)
+def manhattan(graph_path=None):
+    """
+    从显式路径读取并标准化 Manhattan/NYC 路网。
 
     输入：
-    - 无。
+    - graph_path: 可选 GraphML；省略时严格使用 `MANHATTAN_GRAPH_PATH`。
 
     输出：
-    - manhattan_graph: `networkx.MultiDiGraph` 路网图。
+    - 带连续整数节点、`pos` 和 haversine 边权的 `MultiDiGraph`。
 
     实现逻辑：
-    1. 先尝试在根目录或 `datasets/` 中寻找 Manhattan GraphML。
-    2. 若找到，则读取并标准化。
-    3. 若找不到，则构造一个规则网格作为替代。
-    4. 若曼哈顿距离缓存不存在，则额外计算并保存缓存。
+    1. 在任何文件读取前对默认 55k NYC 路径执行本机硬保护。
+    2. 显式路径不存在时默认报错；只有配置开启才检查历史候选或合成图。
+    3. 记录原始规模、最大强连通分量规模和标准化图哈希。
+    4. 地图加载不再创建或读取 `manhattan.json` 全对缓存。
     """
-    # 在候选位置中查找真实 Manhattan 图文件。
-    graph_path = next((path for path in MANHATTAN_GRAPH_CANDIDATES if path.is_file()), None)
-    # 如果没找到真实图，就使用合成网格图。
-    if graph_path is None:
-        # 打印提示信息。
-        print('Manhattan GraphML not found, using a synthetic Manhattan-style grid instance instead.')
-        # 生成一个合成 Manhattan 风格网格图。
-        manhattan_graph = _synthetic_grid_graph(20, 20, origin=(-73.99, 40.75), step=0.002)
-    else:
-        # 读取真实 GraphML 文件。
-        g = nx.MultiDiGraph(nx.read_graphml(graph_path))
-        # 将真实图标准化为统一编号与坐标结构。
-        x_key, y_key = _coordinate_keys(g)
-        nodes = _largest_strong_component(g)
-        manhattan_graph = _normalize_graph(g, x_key, y_key, nodes=nodes)
-    # 确保缓存目录存在。
-    _ensure_datasets_dir()
-    # 如果 Manhattan 距离缓存不存在，就创建它。
-    if not MANHATTAN_CACHE.is_file() and manhattan_graph.number_of_nodes() <= 5000:
-        # 打印缓存构造提示。
-        print('=============preparing pairwise data=================')
-        # 计算所有节点对之间的最短路距离。
-        lengths = dict(nx.all_pairs_dijkstra_path_length(manhattan_graph, weight='weight'))
-        # 将距离字典改写成二维列表，便于 JSON 保存。
-        pairwise_distances = [[lengths[i][j] for j in manhattan_graph.nodes] for i in manhattan_graph.nodes]
-        # 以写入方式打开缓存文件。
-        with MANHATTAN_CACHE.open('w') as f:
-            # 将距离矩阵写入 JSON。
-            json.dump(pairwise_distances, f)
-    # 返回路网图。
+    selected_path = Path(MANHATTAN_GRAPH_PATH if graph_path is None else graph_path).expanduser()
+    enforce_local_graph_guard(graph_path=selected_path)
+    if not selected_path.is_file() and ALLOW_GRAPH_PATH_FALLBACK:
+        selected_path = next(
+            (path for path in MANHATTAN_GRAPH_CANDIDATES if path.is_file()),
+            selected_path,
+        )
+    if not selected_path.is_file():
+        if not ALLOW_SYNTHETIC_GRAPH_FALLBACK:
+            raise FileNotFoundError(
+                f'Manhattan/NYC GraphML 不存在：{selected_path.resolve()}。'
+                '如需检查历史路径，请显式设置 ALLOW_GRAPH_PATH_FALLBACK=True。'
+            )
+        manhattan_graph = _synthetic_grid_graph(
+            20, 20, origin=(-73.99, 40.75), step=0.002
+        )
+        manhattan_graph.graph['dataset_name'] = 'synthetic-manhattan'
+        print(
+            f'Loaded synthetic Manhattan graph: nodes={manhattan_graph.number_of_nodes()}, '
+            f'edges={manhattan_graph.number_of_edges()}, h2h_hash={graph_fingerprint(manhattan_graph)}.'
+        )
+        return manhattan_graph
+
+    raw_graph = nx.MultiDiGraph(nx.read_graphml(selected_path))
+    raw_nodes = raw_graph.number_of_nodes()
+    raw_edges = raw_graph.number_of_edges()
+    x_key, y_key = _coordinate_keys(raw_graph)
+    nodes = _largest_strong_component(raw_graph)
+    manhattan_graph = _normalize_graph(raw_graph, x_key, y_key, nodes=nodes)
+    manhattan_graph.graph['source_path'] = str(selected_path.resolve())
+    manhattan_graph.graph['dataset_name'] = selected_path.stem
+    graph_hash = graph_fingerprint(manhattan_graph)
+    print(
+        f'Loaded Manhattan/NYC graph from {selected_path.resolve()}: '
+        f'raw_nodes={raw_nodes}, raw_edges={raw_edges}, largest_scc_nodes={len(nodes)}, '
+        f'normalized_edges={manhattan_graph.number_of_edges()}, h2h_hash={graph_hash}.'
+    )
+    if MANHATTAN_CACHE.is_file():
+        print(f'Ignoring legacy all-pairs cache {MANHATTAN_CACHE}; it is not loaded or deleted.')
     return manhattan_graph
 
 
-def cambridge():
+@lru_cache(maxsize=4)
+def cambridge(graph_path=None):
     """
-    读取 Cambridge/Boston 路网；若缺失真实数据，可下载或回退到合成网格图。
+    从显式路径读取并标准化 Cambridge/Boston 路网。
 
     输入：
-    - 无。
+    - graph_path: 可选 GraphML；省略时严格使用 `BOSTON_GRAPH_PATH`。
 
     输出：
-    - Cambridge/Boston 路网图。
+    - 最大强连通分量标准化后的 `MultiDiGraph`。
 
     实现逻辑：
-    1. 优先尝试读取本地 `boston.graphml` 或 `cambridge.graphml`。
-    2. 若环境变量允许，则下载小范围 Boston 路网并截取最大强连通分量。
-    3. 若仍失败，则回退到合成 Cambridge 风格网格图。
+    1. 默认只读显式本地文件；联网刷新、历史候选和合成图均需单独配置授权。
+    2. 记录原始节点/边数、最大强连通分量和 H2H 图哈希。
+    3. 旧 1.65 GB pairwise pickle 只提示，不打开、不覆盖、不删除。
     """
-    center_point = _boston_center_point()
-    max_nodes = OSM_MAX_NODES
-
-    # 在候选位置中查找 Boston/Cambridge 图文件。
-    refresh_osm = REFRESH_OSM and ALLOW_OSM_DOWNLOAD
-    graph_path = next((path for path in CAMBRIDGE_GRAPH_CANDIDATES if path.is_file()), None)
-    # 如果本地已有图文件，则直接读取它。
-    if graph_path is not None and not refresh_osm:
-        print(f'Loading road graph from {graph_path}.')
-        g = _read_osm_graphml(graph_path)
-        x_key, y_key = _coordinate_keys(g)
-        if x_key == 'x' and y_key == 'y':
-            g = _limit_nodes_near_center(g, max_nodes, center_point)
-        nodes = _largest_strong_component(g)
-        return _normalize_graph(g, x_key, y_key, nodes=nodes)
-    # 如果环境变量允许联网下载，则尝试使用 OSM 数据。
-    if ALLOW_OSM_DOWNLOAD:
-        try:
-            # 从 OSM 下载小范围可驾驶路网，避免整座 Boston 过大导致 Overpass 失败。
-            graph = _download_boston_graph()
-            graph = _limit_nodes_near_center(graph, max_nodes, center_point)
-            # 取最大强连通分量，确保最短路普遍可达。
-            nodes = _largest_strong_component(graph)
-            # 返回标准化后的真实图。
-            return _normalize_graph(graph, 'x', 'y', nodes=nodes)
-        except Exception as exc:
-            # 下载失败时给出提示。
-            print(f'Unable to download the Boston road network: {type(exc).__name__}: {exc}')
-            print('Using a synthetic Cambridge-style grid instead.')
+    selected_path = Path(BOSTON_GRAPH_PATH if graph_path is None else graph_path).expanduser()
+    refresh_osm = REFRESH_OSM and ALLOW_OSM_DOWNLOAD and graph_path is None
+    if refresh_osm:
+        raw_graph = nx.MultiDiGraph(_download_boston_graph())
+        selected_path = Path(BOSTON_GRAPH_CACHE)
     else:
-        # 若未开启联网下载，则直接提示走离线路径。
-        print('boston.graphml/cambridge.graphml not found, using a synthetic Cambridge-style grid instance instead.')
-    # 返回合成 Cambridge 网格图。
-    return _synthetic_grid_graph(14, 14, origin=(-71.11, 42.37), step=0.003)
+        if not selected_path.is_file() and ALLOW_GRAPH_PATH_FALLBACK:
+            selected_path = next(
+                (path for path in CAMBRIDGE_GRAPH_CANDIDATES if path.is_file()),
+                selected_path,
+            )
+        if not selected_path.is_file():
+            if not ALLOW_SYNTHETIC_GRAPH_FALLBACK:
+                raise FileNotFoundError(
+                    f'Boston/Cambridge GraphML 不存在：{selected_path.resolve()}。'
+                    '如需联网、历史候选或合成图，请分别显式开启对应配置。'
+                )
+            synthetic = _synthetic_grid_graph(
+                14, 14, origin=(-71.11, 42.37), step=0.003
+            )
+            synthetic.graph['dataset_name'] = 'synthetic-boston'
+            print(
+                f'Loaded synthetic Boston graph: nodes={synthetic.number_of_nodes()}, '
+                f'edges={synthetic.number_of_edges()}, h2h_hash={graph_fingerprint(synthetic)}.'
+            )
+            return synthetic
+        raw_graph = _read_osm_graphml(selected_path)
+
+    raw_nodes = raw_graph.number_of_nodes()
+    raw_edges = raw_graph.number_of_edges()
+    x_key, y_key = _coordinate_keys(raw_graph)
+    if x_key == 'x' and y_key == 'y':
+        raw_graph = _limit_nodes_near_center(
+            raw_graph, OSM_MAX_NODES, _boston_center_point()
+        )
+    nodes = _largest_strong_component(raw_graph)
+    graph = _normalize_graph(raw_graph, x_key, y_key, nodes=nodes)
+    graph.graph['source_path'] = str(selected_path.resolve())
+    graph.graph['dataset_name'] = selected_path.stem
+    graph_hash = graph_fingerprint(graph)
+    print(
+        f'Loaded Boston/Cambridge graph from {selected_path.resolve()}: '
+        f'raw_nodes={raw_nodes}, raw_edges={raw_edges}, largest_scc_nodes={len(nodes)}, '
+        f'normalized_edges={graph.number_of_edges()}, h2h_hash={graph_hash}.'
+    )
+    if CAMBRIDGE_CACHE.is_file():
+        print(f'Ignoring legacy all-pairs cache {CAMBRIDGE_CACHE}; it is not loaded or deleted.')
+    return graph
 
 
 def random_multiagent_instance(graph, num_depots, num_destinations):
@@ -495,8 +505,8 @@ def small_instance(num, nodes, depots, cities):
     """
     # 固定随机种子，保证可复现。
     np.random.seed(0)
-    # 读取完整 Manhattan 路网。
-    graph = manhattan()
+    # 小实例使用已冻结的 4,333 节点基线图，不触发默认 55k NYC 目标路径。
+    graph = manhattan(MANHATTAN_BASELINE_GRAPH_PATH)
     # 随机选择一个节点作为 BFS 起点。
     node = np.random.choice(graph.nodes, 1).item()
     # 用队列保存待扩张节点。
@@ -532,10 +542,8 @@ def small_instance(num, nodes, depots, cities):
                 subgraph.add_edge(start, end, weight=graph.edges[start, end, 0]['weight'])
                 # 同时补一条反向边，增强可达性。
                 subgraph.add_edge(end, start, weight=graph.edges[start, end, 0]['weight'])
-    # 在子图上构造卡车和无人机距离矩阵。
-    distance = {'truck': dict(nx.all_pairs_dijkstra_path_length(subgraph, weight='weight')),
-                'drone': {i: {j: haversine(subgraph.nodes[i]['pos'], subgraph.nodes[j]['pos'])
-                              for j in subgraph.nodes} for i in subgraph.nodes}}
+    # 小图通过统一距离工厂运行：卡车使用 eager 基线，无人机距离按需计算。
+    distance = build_distance_provider(subgraph, backend='eager', dataset_name='small-instance')
     # 用于保存多个实例的仓库采样。
     _depots, _cities = [], []
     # 重复采样 `num` 次。
@@ -564,15 +572,15 @@ def multiagent_instance_on_manhattan(num, depots, cities):
 
     实现逻辑：
     1. 读取 Manhattan 路网。
-    2. 构造图上统一的全对距离矩阵。
+    2. 通过统一工厂加载/构建 H2H 与按需无人机距离。
     3. 重复采样仓库和客户节点。
     """
     # 固定随机种子。
     np.random.seed(0)
     # 读取 Manhattan 路网。
     graph = manhattan()
-    # 预计算卡车和无人机距离。
-    distance = _pairwise_distance(graph)
+    # 统一距离工厂会在本机读取默认 55k 图前拦截，服务器则加载 H2H 缓存。
+    distance = _distance_provider(graph, dataset_name=graph.graph.get('dataset_name', 'nyc'))
     # 保存每个实例的仓库集合。
     _depots, _cities = [], []
     # 重复采样 `num` 次。
@@ -591,7 +599,7 @@ def multiagent_instance_on_manhattan(num, depots, cities):
 
 def multiagent_instance_on_cambridge(num, depots, cities):
     """
-    在 Cambridge 路网上生成多仓库随机实例，并复用缓存距离矩阵。
+    在 Cambridge/Boston 路网上生成多仓库随机实例，并复用 H2H 索引缓存。
 
     输入：
     - num: 实例数量。
@@ -603,24 +611,16 @@ def multiagent_instance_on_cambridge(num, depots, cities):
 
     实现逻辑：
     1. 读取 Cambridge 路网。
-    2. 优先从缓存加载距离矩阵。
-    3. 若缓存缺失或与当前图规模不一致，则重新计算并写回缓存。
+    2. 检测旧 pairwise pickle 但不打开；统一工厂按图哈希加载或构建 H2H。
+    3. 无人机距离始终按需计算，不写全对缓存。
     4. 重复采样生成多个随机实例。
     """
     # 固定随机种子。
     np.random.seed(0)
     # 读取 Cambridge 路网。
     graph = cambridge()
-    # 确保缓存目录存在。
-    _ensure_datasets_dir()
-    # 如果距离缓存存在且与当前图签名一致，则优先读取它。
-    distance = _load_pairwise_cache(CAMBRIDGE_CACHE, graph)
-    if distance is None:
-        # 若缓存不存在或与当前 Boston/Cambridge 图不一致，则直接计算距离矩阵。
-        print('Preparing Cambridge/Boston pairwise distance cache.')
-        distance = _pairwise_distance(graph)
-        # 将计算结果写入缓存。
-        _save_pairwise_cache(CAMBRIDGE_CACHE, graph, distance)
+    # 旧 1.65 GB pickle 绝不反序列化；距离工厂只使用版本化 H2H 缓存。
+    distance = _distance_provider(graph, dataset_name=graph.graph.get('dataset_name', 'boston'))
     # 保存每个实例的仓库采样。
     _depots, _cities = [], []
     # 重复采样 `num` 次。
