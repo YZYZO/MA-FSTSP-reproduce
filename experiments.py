@@ -121,6 +121,42 @@ def _solve_instance_job(task):
     return i, cost, elapsed
 
 
+def _clear_process_worker_context():
+    """
+    清理当前进程内的只读实验上下文。
+
+    输入：无。
+    输出：无；将图、仓库、客户和距离对象的模块级引用重置为空。
+    """
+    global _PAR_GRAPH, _PAR_DEPOTS, _PAR_CITIES, _PAR_DISTANCE
+    _PAR_GRAPH = None
+    _PAR_DEPOTS = None
+    _PAR_CITIES = None
+    _PAR_DISTANCE = None
+
+
+def _run_single_worker_instances(tasks, num, graph, depots, cities, distance, desc=None):
+    """
+    在主进程中顺序执行单 worker 实验，避免 Windows 调试器创建 spawn 子进程。
+
+    输入：任务列表、实例数，以及求解所需的图、仓库、客户、距离对象和进度条名称。
+    输出：按实例编号排序的 ``(cost, elapsed)`` 结果列表。
+
+    主进程路径不设置 CPU 亲和性，避免把 VS Code 调试会话及其后续代码固定到单核。
+    无论求解成功还是抛出异常，都会清理临时上下文，避免长期持有大型路网和索引对象。
+    """
+    # 结果槽位与并行路径保持相同顺序，任务完成后按实例编号写回。
+    results = [None] * num
+    _init_process_worker(graph, depots, cities, distance, cpu_affinity=None)
+    try:
+        for task in tqdm(tasks, total=num, desc=desc):
+            i, cost, elapsed = _solve_instance_job(task)
+            results[i] = (cost, elapsed)
+        return results
+    finally:
+        _clear_process_worker_context()
+
+
 def _run_parallel_instances(
     num,
     graph,
@@ -152,6 +188,18 @@ def _run_parallel_instances(
         (algorithm, i, drones, rounds, theta)
         for i in range(num)
     ]
+
+    if worker_count == 1:
+        print('Using one worker in the main process.')
+        return _run_single_worker_instances(
+            tasks,
+            num,
+            graph,
+            depots,
+            cities,
+            distance,
+            desc=desc,
+        )
 
     try:
         ctx = mp.get_context('fork')
