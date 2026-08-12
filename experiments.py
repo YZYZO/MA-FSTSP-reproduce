@@ -10,6 +10,10 @@
 
 # 导入 `sys`，保留给潜在的命令行扩展使用。
 import sys
+# 导入日期时间工具，用运行开始时间生成不会覆盖旧结果的文件名。
+from datetime import datetime
+# 导入路径工具，用传入的 GraphML 文件名生成稳定的地图标识。
+from pathlib import Path
 # 导入论文主算法。
 from src.fstsp import MultiAgentFlyingSidekickTSP
 # 导入实例构造函数与 Manhattan 路网读取函数。   
@@ -30,6 +34,10 @@ import os
 # 导入进程池工具，用于并行运行独立实验实例。
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+from config import MANHATTAN_GRAPH_PATH,MANHATTAN_BASELINE_GRAPH_PATH,MANHATTAN1k_GRAPH_PATH,MANHATTAN11k_GRAPH_PATH
+
 
 
 SMALL_DATA_DIR = result_path('small', 'data')
@@ -232,7 +240,7 @@ def test_small_instance(num, size):
     本版本将每一种算法在 num 个实例上的求解改为 10 进程并行。
     """
     # 生成共享的小规模图、多个 depot/city 采样以及距离矩阵。
-    graph, _depots, _cities, distance = small_instance(num, 20, 2, size)
+    graph, _depots, _cities, distance = small_instance(num, 1100, 2, size)
     # 为四种算法准备成本记录容器。
     costs = {'lrmp': [], 'hc': [], 'stsp': [], 'lp': []}
     # 为四种算法准备耗时记录容器。
@@ -281,15 +289,32 @@ def test_small_instance(num, size):
     )
 
 
-def test_manhattan(num, size):
+def test_manhattan(num, size,map):
     """
     在 Manhattan 路网实例上运行 HC 和论文主算法。
+
+    输入：
+    - num: 本次需要求解的随机实例数量。
+    - size: 每个实例的客户数量。
+    - map: 本次实验使用的 Manhattan/NYC GraphML 路径。
+
+    输出：
+    - 无显式返回值；将本次全部实例汇总到一个带运行时间和地图名的 `.npz` 文件。
+
+    实现逻辑：
+    1. 在函数开始时记录秒级时间戳，并从 GraphML 文件名提取地图名。
+    2. 生成指定地图上的随机实例并运行论文主算法。
+    3. 将成本和耗时写入 Manhattan 结果目录。
 
     本版本将论文主算法在 num 个实例上的求解改为 10 进程并行。
     原文件中的 HC 部分本来就是注释状态，这里保持不运行 HC。
     """
+    # 每次函数调用只写一个文件，因此使用秒级运行开始时间即可区分实验批次。
+    run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    # 从传入路径提取不含扩展名的地图名，例如 `manhatten` 或 `nyc`。
+    map_name = Path(map).stem
     # 生成 Manhattan 路网实例集合。
-    graph, depots, cities, distance = multiagent_instance_on_manhattan(num, 5, size)
+    graph, depots, cities, distance = multiagent_instance_on_manhattan(num, 5, size,map)
     # 为两种算法创建成本记录表。
     costs = {'hc': [], 'stsp': [], 'lp': []}
     # 为两种算法创建耗时记录表。
@@ -306,7 +331,7 @@ def test_manhattan(num, size):
     # 输出论文主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
     _save_npz(
-        MANHATTAN_DATA_DIR / f'road-size-{size}.npz',
+        MANHATTAN_DATA_DIR / f'{run_timestamp}-{map_name}-{size}.npz',
         hc_cost=np.array(costs['hc']),
         hc_time=np.array(times['hc']),
         stsp_cost=np.array(costs['stsp']),
@@ -318,9 +343,23 @@ def test_cambridge(num, size):
     """
     在 Cambridge 路网实例上运行 HC 和论文主算法。
 
+    输入：
+    - num: 本次需要求解的随机实例数量。
+    - size: 每个实例的客户数量。
+
+    输出：
+    - 无显式返回值；将本次全部实例汇总到一个带运行时间和地图名的 `.npz` 文件。
+
+    实现逻辑：
+    1. 在函数开始时记录秒级时间戳，并以 `boston` 作为结果地图名。
+    2. 生成 Cambridge/Boston 随机实例并运行论文主算法。
+    3. 将成本和耗时写入 Boston 结果目录。
+
     本版本将论文主算法在 num 个实例上的求解改为 10 进程并行。
     原文件中的 HC 部分本来就是注释状态，这里保持不运行 HC。
     """
+    # 每次函数调用只写一个文件，因此使用秒级运行开始时间即可区分实验批次。
+    run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     # 生成 Cambridge 路网实例集合。
     graph, depots, cities, distance = multiagent_instance_on_cambridge(num, 10, size)
     # 为两种算法创建成本记录表。
@@ -339,7 +378,103 @@ def test_cambridge(num, size):
     # 输出主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
     _save_npz(
-        BOSTON_DATA_DIR / f'road-size-{size}.npz',
+        BOSTON_DATA_DIR / f'{run_timestamp}-boston-{size}.npz',
+        hc_cost=np.array(costs['hc']),
+        hc_time=np.array(times['hc']),
+        stsp_cost=np.array(costs['stsp']),
+        stsp_time=np.array(times['stsp']),
+    )
+
+
+def test_manhattan_1k(num, size):
+    """
+    在 1,024 节点 Manhattan 路网上运行论文主算法并保存汇总结果。
+
+    输入：
+    - num: 本次需要求解的随机实例数量；论文完整实验使用 100。
+    - size: 每个实例的客户数量；论文使用 50、100、150。
+
+    输出：
+    - 无显式返回值；将本次所有实例的成本和耗时保存为一个 `.npz` 文件。
+
+    实现逻辑：
+    1. 记录函数运行开始时间，作为结果文件名的一部分。
+    2. 从 `nyc_1024.graphml` 生成 5 仓库随机实例。
+    3. 按论文 Manhattan 口径使用每车 3 架无人机和 `(0.5, 0.5)` 阈值求解。
+    4. 将全部实例的汇总结果写入 Manhattan 结果目录。
+    """
+    # 秒级运行时间用于区分不同批次；一次函数调用只生成一个汇总文件。
+    run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    # 论文 Manhattan 场景固定使用 5 个仓库，并显式选择 1,024 节点地图。
+    graph, depots, cities, distance = multiagent_instance_on_manhattan(
+        num, 5, size, MANHATTAN1k_GRAPH_PATH
+    )
+    # 保留与现有路网实验一致的结果结构，HC/LP 当前不执行。
+    costs = {'hc': [], 'stsp': [], 'lp': []}
+    times = {'hc': [], 'stsp': [], 'lp': []}
+
+    print(f'Running Manhattan 1K experiment with {PROCESS_WORKERS} processes.')
+
+    # `limit=1.5` 与 `speed=1.6` 使用主算法构造函数的论文默认值。
+    stsp_results = _run_parallel_instances(
+        num, graph, depots, cities, distance,
+        algorithm='stsp', drones=3, theta=(0.5, 0.5), desc='Manhattan-1K-STSP'
+    )
+    _store_cost_time(costs, times, 'stsp', stsp_results)
+
+    # 输出本批次论文主算法的平均成本和平均耗时。
+    print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
+    # 文件名口径为“运行时间-地图名-客户数量”，本批次只写一个汇总文件。
+    _save_npz(
+        MANHATTAN_DATA_DIR / f'{run_timestamp}-manhattan_1k-{size}.npz',
+        hc_cost=np.array(costs['hc']),
+        hc_time=np.array(times['hc']),
+        stsp_cost=np.array(costs['stsp']),
+        stsp_time=np.array(times['stsp']),
+    )
+
+
+def test_manhattan_11k(num, size):
+    """
+    在 11,000 节点 NYC 路网上按论文 Boston 场景口径运行主算法。
+
+    输入：
+    - num: 本次需要求解的随机实例数量；论文完整实验使用 100。
+    - size: 每个实例的客户数量；论文使用 50、100、150。
+
+    输出：
+    - 无显式返回值；将本次所有实例的成本和耗时保存为一个 `.npz` 文件。
+
+    实现逻辑：
+    1. 记录函数运行开始时间，作为结果文件名的一部分。
+    2. 从 `nyc_11000.graphml` 生成 10 仓库随机实例。
+    3. 将该 11k 地图视作 Boston 复现，按论文口径使用每车 4 架无人机。
+    4. 将全部实例的汇总结果写入 Boston 结果目录。
+    """
+    # 秒级运行时间用于区分不同批次；一次函数调用只生成一个汇总文件。
+    run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    # 按用户确认的 Boston 复现口径使用 10 个仓库，但读取指定的 NYC 11k 地图。
+    graph, depots, cities, distance = multiagent_instance_on_manhattan(
+        num, 10, size, MANHATTAN11k_GRAPH_PATH
+    )
+    # 保留与现有路网实验一致的结果结构，HC/LP 当前不执行。
+    costs = {'hc': [], 'stsp': [], 'lp': []}
+    times = {'hc': [], 'stsp': [], 'lp': []}
+
+    print(f'Running Boston 11K reproduction with {PROCESS_WORKERS} processes.')
+
+    # `limit=1.5` 与 `speed=1.6` 使用主算法构造函数的论文默认值。
+    stsp_results = _run_parallel_instances(
+        num, graph, depots, cities, distance,
+        algorithm='stsp', drones=4, theta=(0.5, 0.5), desc='Boston-11K-STSP'
+    )
+    _store_cost_time(costs, times, 'stsp', stsp_results)
+
+    # 输出本批次论文主算法的平均成本和平均耗时。
+    print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
+    # 文件名口径为“运行时间-地图名-客户数量”，本批次只写一个汇总文件。
+    _save_npz(
+        BOSTON_DATA_DIR / f'{run_timestamp}-boston_11k-{size}.npz',
         hc_cost=np.array(costs['hc']),
         hc_time=np.array(times['hc']),
         stsp_cost=np.array(costs['stsp']),
@@ -697,16 +832,29 @@ def run_full_experiments():
     """
     # 枚举小规模实验中的客户数量。
     # for size in [5, 10, 15]:
-    # #size = 5
+    #size = 10
     #     # 运行当前规模的小规模实验。
-    #     test_small_instance(100, size)
+    #test_small_instance(1, size)
+
+
     # 枚举大规模路网实验中的客户数量。
     #for size in [50, 100, 150]:
     size = 20
-        # 运行 Manhattan 实验。
-    test_manhattan(1, size)
+        # 运行 Manhattan 4k 实验。
+    test_manhattan(1, size, MANHATTAN_BASELINE_GRAPH_PATH)
         # 运行 Cambridge 实验。
     test_cambridge(1, size)
+        # # 运行 Manhattan 55k 实验。
+        # test_manhattan(40, size, MANHATTAN_GRAPH_PATH)
+
+    test_manhattan_1k(1, size)
+
+    test_manhattan_11k(1, size)
+
+
+
+
+
     # # 运行距离上限消融实验。
     # ablation_r()
     # # 运行速度消融实验。

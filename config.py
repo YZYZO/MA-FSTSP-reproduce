@@ -24,8 +24,12 @@ MANHATTAN_GRAPH_PATH = DATASETS_DIR / 'nyc.graphml'
 # 本机小实例只使用已冻结的 4,333 节点基线图，不替代 55k 目标图。
 MANHATTAN_BASELINE_GRAPH_PATH = DATASETS_DIR / 'manhatten.graphml'
 BOSTON_GRAPH_PATH = DATASETS_DIR / 'boston.graphml'
+MANHATTAN1k_GRAPH_PATH = DATASETS_DIR / 'nyc_1024.graphml'
+MANHATTAN11k_GRAPH_PATH = DATASETS_DIR / 'nyc_11000.graphml'
+
 ALLOW_GRAPH_PATH_FALLBACK = False
 ALLOW_SYNTHETIC_GRAPH_FALLBACK = False
+
 
 # 距离后端：`auto` 在小图使用 eager，在更大图上要求 H2H。
 DISTANCE_BACKEND = 'H2H'

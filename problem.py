@@ -554,7 +554,10 @@ def small_instance(num, nodes, depots, cities):
                 # 同时补一条反向边，增强可达性。
                 subgraph.add_edge(end, start, weight=graph.edges[start, end, 0]['weight'])
     # 小图通过统一距离工厂运行：卡车使用 eager 基线，无人机距离按需计算。
-    distance = build_distance_provider(subgraph, backend='eager', dataset_name='small-instance')
+    #distance = build_distance_provider(subgraph, backend='eager', dataset_name='small-instance')
+    distance = build_distance_provider(subgraph, backend='h2h', dataset_name='small-instance')
+    
+    
     # 用于保存多个实例的仓库采样。
     _depots, _cities = [], []
     # 重复采样 `num` 次。
@@ -569,7 +572,7 @@ def small_instance(num, nodes, depots, cities):
     return subgraph, _depots, _cities, distance
 
 
-def multiagent_instance_on_manhattan(num, depots, cities):
+def multiagent_instance_on_manhattan(num, depots, cities,map):
     """
     在 Manhattan 路网上生成多仓库随机实例。
 
@@ -588,8 +591,10 @@ def multiagent_instance_on_manhattan(num, depots, cities):
     """
     # 固定随机种子。
     np.random.seed(0)
+
     # 读取 Manhattan 路网。
-    graph = manhattan()
+    graph = manhattan(map)
+
     # 统一距离工厂会在本机读取默认 55k 图前拦截，服务器则加载 H2H 缓存。
     distance = _distance_provider(graph, dataset_name=graph.graph.get('dataset_name', 'nyc'))
     # 保存每个实例的仓库集合。
