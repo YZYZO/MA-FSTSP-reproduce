@@ -24,23 +24,34 @@ from functools import lru_cache
 from pathlib import Path
 # 导入球面距离函数，用于根据经纬度构造边权。
 from utils import haversine
-from distance_oracle import build_distance_provider
-from h2h_backend import enforce_local_graph_guard, graph_fingerprint
+from src.distance.distance_oracle import build_distance_provider
+from src.distance.h2h_backend import enforce_local_graph_guard, graph_fingerprint
 from config import (
-    ALLOW_OSM_DOWNLOAD,
     ALLOW_GRAPH_PATH_FALLBACK,
     ALLOW_SYNTHETIC_GRAPH_FALLBACK,
     BOSTON_GRAPH_PATH,
     DATASETS_DIR,
     MANHATTAN_BASELINE_GRAPH_PATH,
     MANHATTAN_GRAPH_PATH,
-    OSM_CENTER_POINT,
-    OSM_DIST_METERS,
-    OSM_MAX_NODES,
-    OSM_TIMEOUT,
-    OVERPASS_ENDPOINTS,
     PROJECT_ROOT,
-    REFRESH_OSM,
+)
+
+# 以下参数只服务于 Boston/OSM 路网的下载与裁剪，不属于全局项目配置。
+# 只有同时开启下载授权和刷新开关，`cambridge()` 才会访问 Overpass 网络服务。
+ALLOW_OSM_DOWNLOAD = False
+REFRESH_OSM = False
+# 下载中心点采用 Boston 市中心的纬度、经度顺序，供 OSMnx `graph_from_point` 使用。
+OSM_CENTER_POINT = (42.3601, -71.0589)
+# 下载半径单位为米；只影响显式联网刷新的路网覆盖范围。
+OSM_DIST_METERS = 1600
+# 本地或下载图超过此节点数时，保留中心点附近的连通路网以控制实验规模。
+OSM_MAX_NODES = 11000
+# 单次 Overpass 请求超时秒数，避免网络异常时无限等待。
+OSM_TIMEOUT = 300
+# Overpass 服务端按顺序尝试，前一端点失败后才切换到下一端点。
+OVERPASS_ENDPOINTS = (
+    'https://overpass.kumi.systems/api',
+    'https://overpass-api.de/api',
 )
 
 # 旧全对缓存只用于迁移提示，不再读取、写入或自动删除。

@@ -21,8 +21,9 @@ import time
 # 导入进度条工具 `tqdm`。
 from tqdm import tqdm
 # 导入统一距离工厂，规模实验禁止再构造全对嵌套字典。
-from distance_oracle import build_distance_provider
-from config import RUN_FULL_EXPERIMENTS, ensure_dir, result_path
+from src.distance.distance_oracle import build_distance_provider
+from config import RUN_FULL_EXPERIMENTS
+from utils import ensure_dir, result_path
 
 # 导入 `os`，用于读取/设置 CPU 亲和性。
 import os

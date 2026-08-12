@@ -31,8 +31,7 @@ from problem import (
     multiagent_instance_on_cambridge,
     multiagent_instance_on_manhattan,
 )
-from utils import haversine
-from config import DEMO_DRONE_LIMIT, ensure_dir, result_path
+from utils import ensure_dir, haversine, result_path
 
 
 mpl.rcParams['pdf.fonttype'] = 42
@@ -51,6 +50,8 @@ parameters = {
 }
 plt.rcParams.update(parameters)
 colors = sns.color_palette()
+# 绘图示例使用的无人机航程上限，只影响本文件生成的 demo 图。
+DEMO_DRONE_LIMIT = 0.5
 SMALL_FIGURE_DIR = result_path('small', 'figures')
 MANHATTAN_DATA_DIR = result_path('manhattan', 'data')
 MANHATTAN_FIGURE_DIR = result_path('manhattan', 'figures')

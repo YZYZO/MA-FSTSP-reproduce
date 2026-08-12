@@ -496,32 +496,32 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         return self.solution, self.cost
 
     # function that helps fast generate the results for the ablation study of the drone numbers
-    def solve_multiple_drones(self):
-        """
-        固定客户顺序，快速评估不同无人机数量对应的成本。
+    # def solve_multiple_drones(self):
+    #     """
+    #     固定客户顺序，快速评估不同无人机数量对应的成本。
 
-        输入：
-        - 无显式输入。
+    #     输入：
+    #     - 无显式输入。
 
-        输出：
-        - 一个列表，按 0 到 5 架无人机依次记录成本。
+    #     输出：
+    #     - 一个列表，按 0 到 5 架无人机依次记录成本。
 
-        实现逻辑：
-        1. 先生成仓库分组与访问顺序。
-        2. 在相同顺序下重复调用动态规划近似模块。
-        3. 输出不同无人机数下的成本。
-        """
-        costs = []
-        convex_sets = self.get_boundary_convex_sets(self.theta[0])
-        self.set_mst(convex_sets)
-        for depot in self.depots:
-            convex_set = [[depot]] + [convex_sets[city] for city in self.groups[depot]]
-            cities = self.groups[depot]
-            if len(cities) > 0:
-                seq = self.get_seq(depot, convex_set)
-                seq = [depot] + [cities[i - 1] for i in seq[1:-1]] + [depot]
-                for drone in range(6):
-                    self.drone = drone
-                    _, cost = self.local_search_multi_drone_appr(seq, depot)
-                    costs.append(cost)
-        return costs
+    #     实现逻辑：
+    #     1. 先生成仓库分组与访问顺序。
+    #     2. 在相同顺序下重复调用动态规划近似模块。
+    #     3. 输出不同无人机数下的成本。
+    #     """
+    #     costs = []
+    #     convex_sets = self.get_boundary_convex_sets(self.theta[0])
+    #     self.set_mst(convex_sets)
+    #     for depot in self.depots:
+    #         convex_set = [[depot]] + [convex_sets[city] for city in self.groups[depot]]
+    #         cities = self.groups[depot]
+    #         if len(cities) > 0:
+    #             seq = self.get_seq(depot, convex_set)
+    #             seq = [depot] + [cities[i - 1] for i in seq[1:-1]] + [depot]
+    #             for drone in range(6):
+    #                 self.drone = drone
+    #                 _, cost = self.local_search_multi_drone_appr(seq, depot)
+    #                 costs.append(cost)
+    #     return costs

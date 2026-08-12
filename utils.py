@@ -13,6 +13,37 @@ import math
 import networkx as nx
 # 导入 `numpy`，用于数组与最小值索引计算。
 import numpy as np
+from pathlib import Path
+
+from config import RESULTS_DIR
+
+
+def result_path(*parts) -> Path:
+    """
+    构造项目结果目录下的路径，但不创建任何目录或文件。
+
+    输入：
+    - parts: 依次追加到结果根目录的路径片段。
+
+    输出：
+    - 以 `RESULTS_DIR` 为根的 `Path` 对象。
+    """
+    return RESULTS_DIR.joinpath(*parts)
+
+
+def ensure_dir(path) -> Path:
+    """
+    确保目标目录及其父目录存在，并返回规范化后的路径对象。
+
+    输入：
+    - path: 待创建的字符串路径或 `Path` 对象。
+
+    输出：
+    - 已存在的目录 `Path`；目录缺失时递归创建。
+    """
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
 def euclidean(a, b):

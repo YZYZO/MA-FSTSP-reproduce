@@ -23,7 +23,7 @@ To run all the experiments in the paper, you can use
 ```bash
 python experiments.py
 ```
-Project options are configured in `config.py`. Set `RUN_FULL_EXPERIMENTS=True` there to run the paper-scale suite. Boston/Cambridge OSM download is disabled by default and can be explicitly enabled with `ALLOW_OSM_DOWNLOAD=True`.
+Project-wide options are configured in `config.py`. Set `RUN_FULL_EXPERIMENTS=True` there to run the paper-scale suite. Boston/Cambridge OSM download and refresh settings are colocated with the map-loading implementation in `problem.py`; both switches must be enabled before the code accesses Overpass.
 
 ## H2H distance backend
 

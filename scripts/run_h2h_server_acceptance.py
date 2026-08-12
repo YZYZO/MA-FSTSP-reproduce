@@ -28,7 +28,7 @@ from config import (  # noqa: E402
     H2H_NATIVE_BUILD_DIR,
     MANHATTAN_GRAPH_PATH,
 )
-from h2h_acceptance import (  # noqa: E402
+from scripts.h2h_acceptance import (  # noqa: E402
     benchmark_query_paths,
     benchmark_spawn_workers,
     build_query_workload,
@@ -339,9 +339,9 @@ def run_server_acceptance(arguments: argparse.Namespace) -> dict[str, Any]:
             report['native_build'] = _compile_linux_native(arguments)
 
         # 只有全部服务器前置条件通过后，才在本进程显式放开 55k 保护。
-        import h2h_backend
-        from distance_oracle import build_distance_provider
-        from h2h_backend import (
+        from src.distance import h2h_backend
+        from src.distance.distance_oracle import build_distance_provider
+        from src.distance.h2h_backend import (
             ensure_h2h_index,
             native_artifact_paths,
             read_h2h_index_statistics,

@@ -43,7 +43,7 @@ from config import (
     H2H_QUERY_STATS,
     MANHATTAN_GRAPH_PATH,
 )
-from distance_oracle import ReadOnlyDistanceMatrix
+from .distance_oracle import ReadOnlyDistanceMatrix
 
 
 GRAPH_FORMAT_VERSION = 1

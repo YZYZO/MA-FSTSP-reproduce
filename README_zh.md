@@ -143,15 +143,16 @@ python plot.py
 - `results/boston/maps/solution.html`
 
 ## 配置说明
-项目参数集中放在 `config.py`，不需要在命令行中手动设置 `$env`。
+项目级参数放在 `config.py`；只服务于地图加载或绘图的局部参数分别放在 `problem.py` 和 `plot.py`。
 
 常用项：
 
 - `RUN_FULL_EXPERIMENTS`：是否运行论文全量实验。
-- `ALLOW_OSM_DOWNLOAD`：是否允许用 `osmnx` 下载 Boston/Cambridge 路网。
-- `REFRESH_OSM`：是否强制重新下载 Boston 路网。
-- `OSM_DIST_METERS`：下载中心点周围的半径。
-- `OSM_MAX_NODES`：显式联网刷新 Boston 时允许保留的节点上限。
+- `problem.py / ALLOW_OSM_DOWNLOAD`：是否允许用 `osmnx` 下载 Boston/Cambridge 路网。
+- `problem.py / REFRESH_OSM`：是否强制重新下载 Boston 路网；只有与下载授权同时开启才联网。
+- `problem.py / OSM_DIST_METERS`：下载中心点周围的半径。
+- `problem.py / OSM_MAX_NODES`：显式联网刷新 Boston 时允许保留的节点上限。
+- `plot.py / DEMO_DRONE_LIMIT`：绘图示例使用的无人机航程上限。
 - `DISTANCE_BACKEND`：`auto` 在小图使用 eager，较大图使用 H2H。
 - `H2H_ENABLE_55K`：服务器运行 55k NYC 的显式开关，本机必须保持 `False`。
 - `RESULTS_DIR`：实验与绘图输出目录，默认是 `results/`。

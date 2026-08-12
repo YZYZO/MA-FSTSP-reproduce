@@ -357,7 +357,7 @@ def build_distance_provider(
     label = dataset_name or '<unnamed>'
     if selected == 'h2h':
         # 延迟导入避免 h2h_backend 复用只读基类时形成模块初始化循环。
-        from h2h_backend import (
+        from .h2h_backend import (
             H2HDistanceMatrix,
             enforce_local_graph_guard,
             ensure_h2h_index,
