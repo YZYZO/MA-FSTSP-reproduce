@@ -14,6 +14,8 @@
 ### 根目录主要文件
 - `experiments.py`
   论文实验主入口，负责运行小规模实验、真实/合成路网实验、消融实验与扩展性实验。
+- `experiment_results.py`
+  负责采集三阶段过程数据、校验并保存新格式 NPZ，以及从 NPZ 恢复指定实例。
 - `plot.py`
   读取实验结果并生成图表、示意图与 HTML 地图。
 - `problem.py`
@@ -121,10 +123,117 @@ python experiments.py
 ```
 
 ## 如何生成图表
-运行：
+### 绘制默认 1K/11K 路网结果
 
-```bash
-python plot.py
+`plot.py` 当前默认配置绘制 `manhattan_1k` 与 `boston_11k`。例如，实验结果中的客户数为 20 时，
+在项目根目录运行：
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -c "import plot; plot.plot_large_road_experiment_results(customer_count=20, num_instances=1)"
+```
+
+绘图程序会分别在 `results/manhattan/data/` 与 `results/boston/data/` 中查找
+“同地图、同客户数量”的最新时间戳 NPZ。新格式 NPZ 已经保存最终路线，因此绘图不会重新运行优化算法。
+
+如果一批实验只有 1 个实例，使用 `num_instances=1`，该实例编号为 0。如果一批实验有 100 个实例，
+可以省略 `instance_index`；程序默认选择目标函数最接近中位数的 median 代表实例。也可以显式指定任意实例：
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -c "import plot; plot.plot_large_road_experiment_results(customer_count=100, instance_index=37, num_instances=100)"
+```
+
+### 一次绘制四个路网结果
+
+下面的 PowerShell 命令会同时绘制 `manhatten`、`manhattan_1k`、`boston` 和
+`boston_11k`。示例假设客户数为 20，且每批只有 1 个实例：
+
+```powershell
+@'
+from config import (
+    MANHATTAN_BASELINE_GRAPH_PATH,
+    MANHATTAN1k_GRAPH_PATH,
+    MANHATTAN11k_GRAPH_PATH,
+    BOSTON_GRAPH_PATH,
+)
+from plot import plot_large_road_experiment_results
+
+# 四个结果文件共用同一个绘图入口，但分别指定结果文件地图名和实际 GraphML。
+city_configs = {
+    "manhatten": {
+        "label": "Manhattan baseline",
+        "result_subdir": "manhattan",
+        "result_map_name": "manhatten",
+        "graph_loader": "manhattan",
+        "graph_path": MANHATTAN_BASELINE_GRAPH_PATH,
+        "num_depots": 5,
+        "drones_per_truck": 3,
+    },
+    "manhattan_1k": {
+        "label": "Manhattan 1K",
+        "result_subdir": "manhattan",
+        "result_map_name": "manhattan_1k",
+        "graph_loader": "manhattan",
+        "graph_path": MANHATTAN1k_GRAPH_PATH,
+        "num_depots": 5,
+        "drones_per_truck": 3,
+    },
+    "boston": {
+        "label": "Boston",
+        "result_subdir": "boston",
+        "result_map_name": "boston",
+        "graph_loader": "boston",
+        "graph_path": BOSTON_GRAPH_PATH,
+        "num_depots": 10,
+        "drones_per_truck": 3,
+    },
+    "boston_11k": {
+        "label": "Boston 11K",
+        "result_subdir": "boston",
+        "result_map_name": "boston_11k",
+        "graph_loader": "manhattan",
+        "graph_path": MANHATTAN11k_GRAPH_PATH,
+        "num_depots": 10,
+        "drones_per_truck": 4,
+    },
+}
+
+generated = plot_large_road_experiment_results(
+    city_configs=city_configs,
+    cities=tuple(city_configs),
+    customer_count=20,
+    instance_index=0,
+    num_instances=1,
+)
+
+# 打印每张交互式地图及其 JSON 摘要的实际输出路径。
+for name, files in generated.items():
+    print(f"{name}:")
+    print(f"  map: {files['map']}")
+    print(f"  summary: {files['summary']}")
+'@ | & "D:\Anaconda3\envs\MA-FSTSP\python.exe" -
+```
+
+若四个路网结果各包含 100 个实例，删除 `instance_index=0`，并把 `num_instances=1`
+改为 `num_instances=100`，程序就会为每批结果自动选择 median 实例。
+
+生成的交互式路线地图和摘要位于：
+
+```text
+results/manhattan/maps/*-solution.html
+results/manhattan/maps/*-summary.json
+results/boston/maps/*-solution.html
+results/boston/maps/*-summary.json
+```
+
+用浏览器打开 `*-solution.html` 即可查看卡车和无人机路线；`*-summary.json` 包含阶段耗时、
+客户分组、Set-TSP 顺序和路线统计。
+
+### 运行绘图脚本默认入口
+
+也可以先修改 `plot.py` 顶部的 `LARGE_ROAD_*` 默认配置，然后直接运行：
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" plot.py
 ```
 
 当前脚本已经做了兼容处理：
@@ -172,12 +281,23 @@ python plot.py
 - `results/manhattan/data/depots-time.npy`
 - `results/manhattan/data/depots-cost.npy`
 
-路网对比实验会额外保存：
+路网对比实验会按“运行开始时刻-地图名-客户数量”保存压缩 NPZ，例如：
 
-- `results/manhattan/data/road-size-*.npz`
-- `results/boston/data/road-size-*.npz`
+- `results/manhattan/data/20260812-201927-manhattan_1k-100.npz`
+- `results/boston/data/20260812-202012-boston_11k-100.npz`
 - `results/manhattan/data/quick-road-subset.npz`
 - `results/boston/data/quick-road-instance.npz`
+
+每个新格式路网 NPZ 同时保存全部实例的成本、耗时、仓库/客户节点、Phase 1
+客户分组、Phase 2 访问顺序和最终卡车/无人机联合路线。变长结构使用 JSON 字符串数组，
+加载时不需要开启 pickle。批次还会记录 best、median、worst 三个代表实例的路线距离、
+航程约束和目标值一致性校验；不会保存完整 DP 表或卡车逐道路节点展开结果。
+
+上述结果格式的采集、写入和恢复集中在 `experiment_results.py`。`experiments.py`
+只负责构造并调度实验，`plot.py` 则把恢复后的实例转换成统计图和路线地图。
+
+`plot.py` 默认选择 median 代表实例并直接读取保存路线。只有读取旧版
+`road-size-*.npz`（其中没有路线）时，才会重新构造实例并求解。
 
 其中：
 
@@ -210,7 +330,8 @@ python plot.py
 7. `src/lrmp.py`
 8. `src/fstsp.py`
 9. `experiments.py`
-10. `plot.py`
+10. `experiment_results.py`
+11. `plot.py`
 
 这样会更容易先理解数据流，再理解算法实现。
 

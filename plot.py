@@ -31,7 +31,9 @@ from problem import (
     multiagent_instance_on_cambridge,
     multiagent_instance_on_manhattan,
 )
+from config import MANHATTAN1k_GRAPH_PATH, MANHATTAN11k_GRAPH_PATH
 from utils import ensure_dir, haversine, result_path
+from experiment_results import _load_large_road_saved_result
 
 
 mpl.rcParams['pdf.fonttype'] = 42
@@ -74,7 +76,8 @@ LARGE_ROAD_RESULT_ROOT = result_path()
 LARGE_ROAD_OUTPUT_ROOT = result_path()
 LARGE_ROAD_CITIES = ('manhattan', 'boston')
 LARGE_ROAD_CUSTOMER_COUNT = 100
-LARGE_ROAD_INSTANCE_INDEX = 0
+# 新格式结果默认展示目标函数最接近中位数的代表实例；传入整数仍可指定任意实例。
+LARGE_ROAD_INSTANCE_INDEX = None
 LARGE_ROAD_NUM_INSTANCES = 100
 LARGE_ROAD_LIMIT = 1.5
 LARGE_ROAD_SPEED = 1.6
@@ -96,14 +99,20 @@ LARGE_ROAD_CITY_CONFIGS = {
     'manhattan': {
         'label': 'Manhattan',
         'result_subdir': 'manhattan',
+        'result_map_name': 'manhattan_1k',
         'instance_builder': 'manhattan',
+        'graph_loader': 'manhattan',
+        'graph_path': MANHATTAN1k_GRAPH_PATH,
         'num_depots': 5,
         'drones_per_truck': 1,
     },
     'boston': {
         'label': 'Boston',
         'result_subdir': 'boston',
-        'instance_builder': 'boston',
+        'result_map_name': 'boston_11k',
+        'instance_builder': 'manhattan',
+        'graph_loader': 'manhattan',
+        'graph_path': MANHATTAN11k_GRAPH_PATH,
         'num_depots': 5,
         'drones_per_truck': 1,
     },
@@ -1283,9 +1292,22 @@ def _line_popup(title, rows):
 
 
 def _large_road_result_file(result_root, city_key, config, customer_count):
+    """
+    查找指定路网与客户规模的最新一批实验结果。
+
+    输入：结果根目录、城市键、城市配置和客户数量。
+    输出：显式配置文件、最新时间戳文件，或用于兼容旧格式的固定文件路径。
+    """
     if config.get('result_file'):
         return Path(config['result_file'])
-    return Path(result_root) / config.get('result_subdir', city_key) / 'data' / f'road-size-{customer_count}.npz'
+    result_dir = Path(result_root) / config.get('result_subdir', city_key) / 'data'
+    map_name = config.get('result_map_name')
+    if map_name:
+        # 文件名以可排序时间戳开头，因此按名称最大值即可取得最新运行批次。
+        candidates = sorted(result_dir.glob(f'*-{map_name}-{customer_count}.npz'))
+        if candidates:
+            return candidates[-1]
+    return result_dir / f'road-size-{customer_count}.npz'
 
 
 def _large_road_output_dir(output_root, city_key, config):
@@ -1294,27 +1316,69 @@ def _large_road_output_dir(output_root, city_key, config):
     return Path(output_root) / config.get('result_subdir', city_key) / 'maps'
 
 
-def _load_large_road_saved_result(result_file, instance_index):
-    data = np.load(result_file, allow_pickle=True)
-    try:
-        if 'stsp_cost' not in data.files:
-            print(f"Skipping {result_file}: missing 'stsp_cost'.")
-            return None, 0
-        costs = np.asarray(data['stsp_cost']).reshape(-1)
-        if instance_index >= len(costs):
-            print(
-                f'Skipping {result_file}: instance_index={instance_index} '
-                f'is outside saved result count {len(costs)}.'
-            )
-            return None, len(costs)
-        saved = {'cost': float(costs[instance_index])}
-        if 'stsp_time' in data.files:
-            times = np.asarray(data['stsp_time']).reshape(-1)
-            if instance_index < len(times):
-                saved['time'] = float(times[instance_index])
-        return saved, len(costs)
-    finally:
-        data.close()
+def _telemetry_from_saved_result(saved_result):
+    """
+    将新格式 NPZ 中的阶段数组恢复为现有地图摘要所需的 telemetry 结构。
+
+    输入：`_load_large_road_saved_result` 返回的新格式实例记录。
+    输出：包含总计时和逐仓库记录的字典。
+    """
+    groups = saved_result.get('phase1_groups') or []
+    orders = saved_result.get('phase2_orders') or []
+    phase2_times = saved_result.get('phase2_time') or []
+    phase3_times = saved_result.get('phase3_time') or []
+    phase_costs = saved_result.get('phase_costs') or []
+    depot_records = []
+    for depot_index, depot in enumerate(saved_result['depots']):
+        group = groups[depot_index] if depot_index < len(groups) else {}
+        order = orders[depot_index] if depot_index < len(orders) else {}
+        customers = list(group.get('customers', order.get('customers', [])))
+        depot_records.append({
+            'depot_index': depot_index,
+            'depot_node': depot,
+            'customer_count': len(customers),
+            'customers': customers,
+            'convex_set_sizes': order.get('convex_set_sizes', []),
+            'set_tsp_solver': order.get('set_tsp_solver', 'unknown'),
+            'set_tsp_sequence': order.get('set_tsp_sequence', []),
+            'visit_route': order.get('visit_route', [depot, depot]),
+            'objective_contribution': (
+                phase_costs[depot_index] if depot_index < len(phase_costs) else None
+            ),
+            'timings': {
+                'set_tsp_seconds': (
+                    phase2_times[depot_index] if depot_index < len(phase2_times) else None
+                ),
+                'local_search_seconds': (
+                    phase3_times[depot_index] if depot_index < len(phase3_times) else None
+                ),
+            },
+        })
+    return {
+        'timings': {
+            'boundary_convex_sets_seconds': saved_result.get('phase1_boundary_time'),
+            'mst_partition_seconds': saved_result.get('phase1_partition_time'),
+            'solve_seconds': saved_result.get('time'),
+        },
+        'depot_records': depot_records,
+        'objective_value': saved_result['cost'],
+    }
+
+
+def _load_graph_for_saved_result(config):
+    """
+    根据城市配置只加载新格式结果所对应的路网，不重新生成实例或运行求解器。
+
+    输入：包含 `graph_loader` 和可选 `graph_path` 的城市配置。
+    输出：标准化后的 NetworkX 路网图。
+    """
+    graph_loader = config.get('graph_loader', config.get('instance_builder'))
+    graph_path = config.get('graph_path')
+    if graph_loader == 'manhattan':
+        return manhattan(graph_path)
+    if graph_loader == 'boston':
+        return cambridge(graph_path)
+    raise ValueError(f'unknown graph_loader={graph_loader!r}')
 
 
 def _folium_graph_center_and_bounds(graph):
@@ -1518,11 +1582,13 @@ def plot_large_road_experiment_results(
     draw_road_edges=None,
 ):
     """
-    Visualize large Manhattan/Boston road-network experiment results.
+    可视化 Manhattan/Boston 大路网实验结果。
 
-    The saved .npz files contain only cost/time arrays, so this function
-    rebuilds the same deterministic experiment instance and solves the selected
-    instance again to recover the truck/drone routes for mapping.
+    输入：结果/输出根目录、城市配置、客户规模、可选实例编号和绘图开关。
+    输出：每个成功生成城市对应的地图、摘要和源结果路径。
+
+    新格式 NPZ 直接恢复保存的输入、三阶段记录和最终路线；未指定实例编号时选择
+    median 代表实例。旧格式只有成本/耗时时，才保留重新生成实例并求解的兼容路径。
     """
     result_root = LARGE_ROAD_RESULT_ROOT if result_root is None else Path(result_root)
     output_root = LARGE_ROAD_OUTPUT_ROOT if output_root is None else Path(output_root)
@@ -1541,8 +1607,7 @@ def plot_large_road_experiment_results(
 
         config = city_configs[city_key]
         local_customer_count = config.get('customer_count', customer_count)
-        local_instance_index = config.get('instance_index', instance_index)
-        local_num_instances = max(config.get('num_instances', num_instances), local_instance_index + 1)
+        requested_instance_index = config.get('instance_index', instance_index)
         local_num_depots = config['num_depots']
         default_drones = LARGE_ROAD_CITY_CONFIGS.get(city_key, {}).get('drones_per_truck', 3)
         local_drones = config.get('drones_per_truck', default_drones)
@@ -1555,40 +1620,81 @@ def plot_large_road_experiment_results(
         if not _require_files(result_file):
             continue
 
-        saved_result, saved_count = _load_large_road_saved_result(result_file, local_instance_index)
+        saved_result, saved_count = _load_large_road_saved_result(
+            result_file, requested_instance_index
+        )
         if saved_result is None and saved_count == 0:
             continue
-        if saved_count and local_instance_index >= saved_count:
+        if saved_result is None:
             continue
-
-        builder_key = config.get('instance_builder', city_key)
-        if builder_key not in LARGE_ROAD_INSTANCE_BUILDERS:
-            print(f'Skipping {city_label}: unknown instance_builder={builder_key}.')
-            continue
-        builder = LARGE_ROAD_INSTANCE_BUILDERS[builder_key]
-        print(
-            f'Building {city_label} instance {local_instance_index}: '
-            f'depots={local_num_depots}, customers={local_customer_count}, drones={local_drones}.'
+        local_instance_index = saved_result['instance_index']
+        local_num_instances = max(
+            config.get('num_instances', num_instances), local_instance_index + 1
         )
-        graph, depots, city_nodes, distance = builder(local_num_instances, local_num_depots, local_customer_count)
-        selected_depots = depots[local_instance_index]
-        selected_cities = city_nodes[local_instance_index]
 
-        model = MultiAgentFlyingSidekickTSP(
-            graph,
-            selected_depots,
-            selected_cities,
-            distance,
-            local_drones,
-            limit=local_limit,
-            speed=local_speed,
-            theta=local_theta,
-        )
-        solution, solved_cost, telemetry = _solve_large_road_with_telemetry(model)
+        if saved_result.get('solution') is not None:
+            # 新格式直接使用保存的实例与最终解，绘图过程不再调用优化求解器。
+            print(
+                f'Loading saved {city_label} instance {local_instance_index} from {result_file}.'
+            )
+            graph = _load_graph_for_saved_result(config)
+            selected_depots = saved_result['depots']
+            selected_cities = saved_result['cities']
+            solution = saved_result['solution']
+            solved_cost = saved_result['cost']
+            telemetry = _telemetry_from_saved_result(saved_result)
+            groups = {
+                record['depot_node']: list(record['customers'])
+                for record in telemetry['depot_records']
+            }
+            local_num_depots = len(selected_depots)
+            local_customer_count = len(selected_cities)
+            local_drones = saved_result.get('drones_per_truck', local_drones)
+            local_limit = saved_result.get('limit', local_limit)
+            local_speed = saved_result.get('speed', local_speed)
+            local_theta = saved_result.get('theta', local_theta)
+        else:
+            # 旧格式结果没有路线，只能按旧逻辑重新生成同编号实例并求解。
+            builder_key = config.get('instance_builder', city_key)
+            if builder_key not in LARGE_ROAD_INSTANCE_BUILDERS:
+                print(f'Skipping {city_label}: unknown instance_builder={builder_key}.')
+                continue
+            builder = LARGE_ROAD_INSTANCE_BUILDERS[builder_key]
+            print(
+                f'Building legacy {city_label} instance {local_instance_index}: '
+                f'depots={local_num_depots}, customers={local_customer_count}, drones={local_drones}.'
+            )
+            if builder_key == 'manhattan':
+                graph, depots, city_nodes, distance = builder(
+                    local_num_instances,
+                    local_num_depots,
+                    local_customer_count,
+                    config.get('graph_path'),
+                )
+            else:
+                graph, depots, city_nodes, distance = builder(
+                    local_num_instances, local_num_depots, local_customer_count
+                )
+            selected_depots = depots[local_instance_index]
+            selected_cities = city_nodes[local_instance_index]
+            model = MultiAgentFlyingSidekickTSP(
+                graph,
+                selected_depots,
+                selected_cities,
+                distance,
+                local_drones,
+                limit=local_limit,
+                speed=local_speed,
+                theta=local_theta,
+            )
+            solution, solved_cost, telemetry = _solve_large_road_with_telemetry(model)
+            groups = model.groups
 
         output_dir = _large_road_output_dir(output_root, city_key, config)
-        output_path = output_dir / f'road-size-{local_customer_count}-instance-{local_instance_index:03d}-solution.html'
-        summary_path = output_dir / f'road-size-{local_customer_count}-instance-{local_instance_index:03d}-summary.json'
+        # 使用源结果文件名作为前缀，使地图也携带运行时刻、地图名和客户数量。
+        output_basename = f'{result_file.stem}-instance-{local_instance_index:03d}'
+        output_path = output_dir / f'{output_basename}-solution.html'
+        summary_path = output_dir / f'{output_basename}-summary.json'
         route_stats = _large_road_route_stats(
             graph,
             solution,
@@ -1598,6 +1704,7 @@ def plot_large_road_experiment_results(
         )
         summary_config = {
             **config,
+            'num_depots': local_num_depots,
             'limit': local_limit,
             'speed': local_speed,
             'theta': local_theta,
@@ -1614,7 +1721,7 @@ def plot_large_road_experiment_results(
             city_label,
             local_customer_count,
             local_instance_index,
-            local_num_instances,
+            saved_count or local_num_instances,
             saved_result,
             solved_cost,
             telemetry,
@@ -1625,7 +1732,7 @@ def plot_large_road_experiment_results(
             graph,
             selected_depots,
             selected_cities,
-            model.groups,
+            groups,
             solution,
             output_path,
             summary,

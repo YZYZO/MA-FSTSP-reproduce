@@ -28,14 +28,17 @@ from tqdm import tqdm
 from src.distance.distance_oracle import build_distance_provider
 from config import RUN_FULL_EXPERIMENTS
 from utils import ensure_dir, result_path
+from experiment_results import (
+    _save_npz,
+    _save_stsp_batch_result,
+    _solve_model_with_process_data,
+)
 
 # 导入 `os`，用于读取/设置 CPU 亲和性。
 import os
 # 导入进程池工具，用于并行运行独立实验实例。
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
-
 from config import MANHATTAN_GRAPH_PATH,MANHATTAN_BASELINE_GRAPH_PATH,MANHATTAN1k_GRAPH_PATH,MANHATTAN11k_GRAPH_PATH
 
 
@@ -50,12 +53,6 @@ def _save_array(path, array):
     np.save(path, np.array(array))
 
 
-def _save_npz(path, **arrays):
-    ensure_dir(path.parent)
-    np.savez(path, **arrays)
-
-
-    
 # 固定使用 10 个进程并行运行实例。
 PROCESS_WORKERS = 1
 # 默认把这 10 个进程限制在当前允许 CPU 集合中的前 10 个逻辑 CPU 上。
@@ -68,7 +65,6 @@ _PAR_GRAPH = None
 _PAR_DEPOTS = None
 _PAR_CITIES = None
 _PAR_DISTANCE = None
-
 
 
 def _init_process_worker(graph, depots, cities, distance, cpu_affinity=None):
@@ -90,7 +86,7 @@ def _solve_instance_job(task):
     子进程执行单个实例。
 
     task: (algorithm, index, drones, rounds, theta)
-    返回: (index, cost, elapsed)
+    返回: `(index, cost, elapsed, solution, process_data)`。
     """
     algorithm, i, drones, rounds, theta = task
     depots = _PAR_DEPOTS[i]
@@ -104,11 +100,13 @@ def _solve_instance_job(task):
             _PAR_GRAPH, depots, cities, _PAR_DISTANCE, drones, theta=theta
         )
 
-    start = time.time()
-    _, cost = model.solve()
-    elapsed = time.time() - start
+    if algorithm != 'stsp':
+        raise ValueError(f'当前并行实验记录器只支持 stsp，收到 algorithm={algorithm!r}')
 
-    return i, cost, elapsed
+    solution, cost, process_data = _solve_model_with_process_data(model)
+    elapsed = process_data['solve_seconds']
+
+    return i, cost, elapsed, solution, process_data
 
 
 def _clear_process_worker_context():
@@ -130,7 +128,7 @@ def _run_single_worker_instances(tasks, num, graph, depots, cities, distance, de
     在主进程中顺序执行单 worker 实验，避免 Windows 调试器创建 spawn 子进程。
 
     输入：任务列表、实例数，以及求解所需的图、仓库、客户、距离对象和进度条名称。
-    输出：按实例编号排序的 ``(cost, elapsed)`` 结果列表。
+    输出：按实例编号排序的 ``(cost, elapsed, solution, process_data)`` 结果列表。
 
     主进程路径不设置 CPU 亲和性，避免把 VS Code 调试会话及其后续代码固定到单核。
     无论求解成功还是抛出异常，都会清理临时上下文，避免长期持有大型路网和索引对象。
@@ -140,8 +138,8 @@ def _run_single_worker_instances(tasks, num, graph, depots, cities, distance, de
     _init_process_worker(graph, depots, cities, distance, cpu_affinity=None)
     try:
         for task in tqdm(tasks, total=num, desc=desc):
-            i, cost, elapsed = _solve_instance_job(task)
-            results[i] = (cost, elapsed)
+            i, cost, elapsed, solution, process_data = _solve_instance_job(task)
+            results[i] = (cost, elapsed, solution, process_data)
         return results
     finally:
         _clear_process_worker_context()
@@ -217,20 +215,21 @@ def _run_parallel_instances(
         }
 
         for future in tqdm(as_completed(futures), total=num, desc=desc):
-            i, cost, elapsed = future.result()
-            results[i] = (cost, elapsed)
+            i, cost, elapsed, solution, process_data = future.result()
+            results[i] = (cost, elapsed, solution, process_data)
 
     return results
 
 
 def _store_cost_time(costs, times, key, results):
     """
-    将并行任务返回的 (cost, elapsed) 写回成本表和耗时表。
+    将并行任务返回记录中的 cost/elapsed 写回成本表和耗时表。
+
+    输入：成本表、耗时表、算法键和实例结果列表。
+    输出：无；只更新传入的两个结果表，忽略路线与过程数据字段。
     """
     costs[key] = [item[0] for item in results]
     times[key] = [item[1] for item in results]
-
-
 
 
 def test_small_instance(num, size):
@@ -330,12 +329,15 @@ def test_manhattan(num, size,map):
 
     # 输出论文主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
-    _save_npz(
+    _save_stsp_batch_result(
         MANHATTAN_DATA_DIR / f'{run_timestamp}-{map_name}-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        3,
+        costs,
+        times,
     )
 
 
@@ -377,12 +379,15 @@ def test_cambridge(num, size):
 
     # 输出主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
-    _save_npz(
+    _save_stsp_batch_result(
         BOSTON_DATA_DIR / f'{run_timestamp}-boston-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        3,
+        costs,
+        times,
     )
 
 
@@ -425,12 +430,15 @@ def test_manhattan_1k(num, size):
     # 输出本批次论文主算法的平均成本和平均耗时。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
     # 文件名口径为“运行时间-地图名-客户数量”，本批次只写一个汇总文件。
-    _save_npz(
+    _save_stsp_batch_result(
         MANHATTAN_DATA_DIR / f'{run_timestamp}-manhattan_1k-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        3,
+        costs,
+        times,
     )
 
 
@@ -473,12 +481,15 @@ def test_manhattan_11k(num, size):
     # 输出本批次论文主算法的平均成本和平均耗时。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
     # 文件名口径为“运行时间-地图名-客户数量”，本批次只写一个汇总文件。
-    _save_npz(
+    _save_stsp_batch_result(
         BOSTON_DATA_DIR / f'{run_timestamp}-boston_11k-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        4,
+        costs,
+        times,
     )
 
 
