@@ -650,337 +650,337 @@ def test_cambridge(num, size):
     )
 
 
-def ablation_r():
-    """
-    研究飞行距离上限 `limit` 对算法性能的影响。
+# def ablation_r():
+#     """
+#     研究飞行距离上限 `limit` 对算法性能的影响。
 
-    输入：
-    - 无显式输入，函数内部固定使用 20 组实例、5 个仓库、100 个客户。
+#     输入：
+#     - 无显式输入，函数内部固定使用 20 组实例、5 个仓库、100 个客户。
 
-    输出：
-    - 将每个 `limit` 下的耗时保存到 `r-time.npy`。
-    - 将每个 `limit` 下的成本保存到 `r-cost.npy`。
+#     输出：
+#     - 将每个 `limit` 下的耗时保存到 `r-time.npy`。
+#     - 将每个 `limit` 下的成本保存到 `r-cost.npy`。
 
-    实现逻辑：
-    1. 生成固定的一批 Manhattan 实例。
-    2. 枚举不同的飞行半径上限。
-    3. 对每个上限重复求解，并保存全部原始结果。
-    """
-    # 打印实验主题。
-    print('Studying the effect of radius limit')
-    # 生成固定的一批 Manhattan 实例。
-    graph, depots, cities, distance = multiagent_instance_on_manhattan(20, 5, 100)
-    # 初始化成本和耗时容器。
-    costs, times = [], []
-    # 枚举不同半径参数。
-    for r in range(5, 16, 2):
-        # 为当前半径开辟成本列表。
-        costs.append([])
-        # 为当前半径开辟耗时列表。
-        times.append([])
-        # 遍历 100 个随机实例。
-        for i in tqdm(range(100)):
-            # 构造主算法模型，其中 `limit=r/10`。
-            model = MultiAgentFlyingSidekickTSP(graph, depots[i], cities[i], distance, 3, limit=r / 10, theta=(0.5, 0.5))
-            # 开始计时。
-            start = time.time()
-            # 求解当前实例。
-            _, cost = model.solve()
-            # 保存当前实例耗时。
-            times[-1].append(time.time() - start)
-            # 保存当前实例成本。
-            costs[-1].append(cost)
-    # 将耗时数组保存到磁盘。
-    _save_array(MANHATTAN_DATA_DIR / 'r-time.npy', times)
-    # 将成本数组保存到磁盘。
-    _save_array(MANHATTAN_DATA_DIR / 'r-cost.npy', costs)
-
-
-def ablation_speed():
-    """
-    研究无人机速度比对算法性能的影响。
-
-    输入：
-    - 无显式输入，函数内部固定使用一批 Manhattan 实例。
-
-    输出：
-    - 将速度实验耗时保存到 `speed-time.npy`。
-    - 将速度实验成本保存到 `speed-cost.npy`。
-
-    实现逻辑：
-    1. 生成固定实例。
-    2. 枚举不同的无人机速度参数。
-    3. 对每个速度统计总耗时与所有成本样本。
-    """
-    # 打印实验主题。
-    print('Studying the effect of speed')
-    # 生成固定的一批 Manhattan 实例。
-    graph, depots, cities, distance = multiagent_instance_on_manhattan(20, 5, 100)
-    # 初始化成本和耗时容器。
-    costs, times = [], []
-    # 枚举不同速度比。
-    for speed in [i / 30 for i in range(10, 120, 20)]:
-        # 为当前速度开辟成本列表。
-        costs.append([])
-        # 为当前速度累计总耗时。
-        times.append(0)
-        # 遍历 100 个随机实例。
-        for i in tqdm(range(100)):
-            # 构造主算法模型，其中速度设为当前 `speed`。
-            model = MultiAgentFlyingSidekickTSP(graph, depots[i], cities[i], distance, 3, speed=speed)
-            # 开始计时。
-            start = time.time()
-            # 求解当前实例。
-            _, cost = model.solve()
-            # 累加总耗时。
-            times[-1] += time.time() - start
-            # 记录当前实例成本。
-            costs[-1].append(cost)
-    # 保存耗时数组。
-    _save_array(MANHATTAN_DATA_DIR / 'speed-time.npy', times)
-    # 保存成本数组。
-    _save_array(MANHATTAN_DATA_DIR / 'speed-cost.npy', costs)
+#     实现逻辑：
+#     1. 生成固定的一批 Manhattan 实例。
+#     2. 枚举不同的飞行半径上限。
+#     3. 对每个上限重复求解，并保存全部原始结果。
+#     """
+#     # 打印实验主题。
+#     print('Studying the effect of radius limit')
+#     # 生成固定的一批 Manhattan 实例。
+#     graph, depots, cities, distance = multiagent_instance_on_manhattan(20, 5, 100)
+#     # 初始化成本和耗时容器。
+#     costs, times = [], []
+#     # 枚举不同半径参数。
+#     for r in range(5, 16, 2):
+#         # 为当前半径开辟成本列表。
+#         costs.append([])
+#         # 为当前半径开辟耗时列表。
+#         times.append([])
+#         # 遍历 100 个随机实例。
+#         for i in tqdm(range(100)):
+#             # 构造主算法模型，其中 `limit=r/10`。
+#             model = MultiAgentFlyingSidekickTSP(graph, depots[i], cities[i], distance, 3, limit=r / 10, theta=(0.5, 0.5))
+#             # 开始计时。
+#             start = time.time()
+#             # 求解当前实例。
+#             _, cost = model.solve()
+#             # 保存当前实例耗时。
+#             times[-1].append(time.time() - start)
+#             # 保存当前实例成本。
+#             costs[-1].append(cost)
+#     # 将耗时数组保存到磁盘。
+#     _save_array(MANHATTAN_DATA_DIR / 'r-time.npy', times)
+#     # 将成本数组保存到磁盘。
+#     _save_array(MANHATTAN_DATA_DIR / 'r-cost.npy', costs)
 
 
-def ablation_k():
-    """
-    研究无人机数量对主算法性能的影响。
+# def ablation_speed():
+#     """
+#     研究无人机速度比对算法性能的影响。
 
-    输入：
-    - 无显式输入，函数内部枚举客户规模并测试 0 到 5 架无人机。
+#     输入：
+#     - 无显式输入，函数内部固定使用一批 Manhattan 实例。
 
-    输出：
-    - 将所有规模下的无人机数量成本矩阵保存为 `k-cost.npy`。
+#     输出：
+#     - 将速度实验耗时保存到 `speed-time.npy`。
+#     - 将速度实验成本保存到 `speed-cost.npy`。
 
-    实现逻辑：
-    1. 枚举不同客户规模。
-    2. 对每个规模运行 `solve_multiple_drones`。
-    3. 保存每个规模下不同无人机数量的成本结果。
-    """
-    # 打印实验主题。
-    print('studying the effect of drone number')
-    # 用于汇总所有规模的成本矩阵。
-    all_costs = []
-    # 枚举客户规模。
-    for size in range(50, 160, 20):
-        # 生成当前规模的 Manhattan 实例。
-        graph, depots, cities, distance = multiagent_instance_on_manhattan(10, 5, size)
-        # 存放当前规模下所有样本的成本。
-        costs, times = [], []
-        # 遍历 100 个随机实例。
-        for i in tqdm(range(100)):
-            # 构造主算法模型，初始无人机数给 0，随后由 `solve_multiple_drones` 枚举。
-            model = MultiAgentFlyingSidekickTSP(graph, depots[i], cities[i], distance, 0)
-            # 求出 0~5 架无人机对应的成本序列。
-            cost = model.solve_multiple_drones()
-            # 保存当前实例结果。
-            costs.append(cost.copy())
-        # 将当前规模的结果转为数组并加入总表。
-        all_costs.append(np.array(costs))
-        # 打印当前规模下的平均成本。
-        print(f'size {size} gives {np.mean(costs, axis=0)}')
-    # 将总结果保存到磁盘。
-    _save_array(MANHATTAN_DATA_DIR / 'k-cost.npy', np.array(all_costs, dtype=float))
-
-
-def scale_cities():
-    """
-    固定仓库数量，研究客户数量增长时主算法的可扩展性。
-
-    输入：
-    - 无显式输入，内部固定使用 Manhattan 路网。
-
-    输出：
-    - 保存耗时到 `city-time.npy`。
-    - 保存成本到 `city-cost.npy`。
-
-    实现逻辑：
-    1. 先构造 Manhattan 路网和距离矩阵。
-    2. 枚举不同客户数量。
-    3. 每个数量下重复采样并统计性能。
-    """
-    # 打印实验主题。
-    print('studying the scalability of fix depot case')
-    # 读取 Manhattan 路网。
-    graph = manhattan()
-    # 三类规模实验共享同一图哈希 H2H 缓存，无人机距离保持按需计算。
-    distance = build_distance_provider(
-        graph,
-        dataset_name=graph.graph.get('dataset_name', 'nyc'),
-        graph_path=graph.graph.get('source_path'),
-    )
-    # 初始化成本和耗时容器。
-    costs, times = [], []
-    # 枚举客户数量。
-    for num in range(120, 350, 40):
-        # 为当前规模开辟成本列表。
-        costs.append([])
-        # 为当前规模开辟耗时列表。
-        times.append([])
-        # 重复 100 次随机采样。
-        for _ in tqdm(range(100)):
-            # 从图节点中随机采样仓库和客户。
-            locations = np.random.choice(graph.nodes, num + 10, replace=False)
-            # 构造主算法模型。
-            model = MultiAgentFlyingSidekickTSP(graph, locations[:10], locations[10:], distance, 3)
-            # 开始计时。
-            start = time.time()
-            # 求解当前实例。
-            _, cost = model.solve()
-            # 保存耗时。
-            times[-1].append(time.time() - start)
-            # 保存成本。
-            costs[-1].append(cost)
-    # 保存耗时结果。
-    _save_array(MANHATTAN_DATA_DIR / 'city-time.npy', times)
-    # 保存成本结果。
-    _save_array(MANHATTAN_DATA_DIR / 'city-cost.npy', costs)
+#     实现逻辑：
+#     1. 生成固定实例。
+#     2. 枚举不同的无人机速度参数。
+#     3. 对每个速度统计总耗时与所有成本样本。
+#     """
+#     # 打印实验主题。
+#     print('Studying the effect of speed')
+#     # 生成固定的一批 Manhattan 实例。
+#     graph, depots, cities, distance = multiagent_instance_on_manhattan(20, 5, 100)
+#     # 初始化成本和耗时容器。
+#     costs, times = [], []
+#     # 枚举不同速度比。
+#     for speed in [i / 30 for i in range(10, 120, 20)]:
+#         # 为当前速度开辟成本列表。
+#         costs.append([])
+#         # 为当前速度累计总耗时。
+#         times.append(0)
+#         # 遍历 100 个随机实例。
+#         for i in tqdm(range(100)):
+#             # 构造主算法模型，其中速度设为当前 `speed`。
+#             model = MultiAgentFlyingSidekickTSP(graph, depots[i], cities[i], distance, 3, speed=speed)
+#             # 开始计时。
+#             start = time.time()
+#             # 求解当前实例。
+#             _, cost = model.solve()
+#             # 累加总耗时。
+#             times[-1] += time.time() - start
+#             # 记录当前实例成本。
+#             costs[-1].append(cost)
+#     # 保存耗时数组。
+#     _save_array(MANHATTAN_DATA_DIR / 'speed-time.npy', times)
+#     # 保存成本数组。
+#     _save_array(MANHATTAN_DATA_DIR / 'speed-cost.npy', costs)
 
 
-def scale_rates():
-    """
-    固定客户与仓库比例，研究规模增长时主算法的可扩展性。
+# def ablation_k():
+#     """
+#     研究无人机数量对主算法性能的影响。
 
-    输入：
-    - 无显式输入，内部固定客户仓库比例为 20:1。
+#     输入：
+#     - 无显式输入，函数内部枚举客户规模并测试 0 到 5 架无人机。
 
-    输出：
-    - 保存耗时到 `rates-time.npy`。
-    - 保存成本到 `rates-cost.npy`。
+#     输出：
+#     - 将所有规模下的无人机数量成本矩阵保存为 `k-cost.npy`。
 
-    实现逻辑：
-    1. 读取 Manhattan 路网。
-    2. 枚举仓库数量。
-    3. 按照固定比例同时增加客户数量。
-    """
-    # 打印实验主题。
-    print('studying the scalability of fix rates case')
-    # 读取 Manhattan 路网。
-    graph = manhattan()
-    # 使用与其他规模实验相同的数据集名，确保只构建一份版本化索引。
-    distance = build_distance_provider(
-        graph,
-        dataset_name=graph.graph.get('dataset_name', 'nyc'),
-        graph_path=graph.graph.get('source_path'),
-    )
-    # 初始化成本和耗时容器。
-    costs, times = [], []
-    # 枚举仓库数。
-    for num in range(3, 21, 3):
-        # 为当前规模开辟成本列表。
-        costs.append([])
-        # 为当前规模开辟耗时列表。
-        times.append([])
-        # 重复 100 次随机采样。
-        for _ in tqdm(range(100)):
-            # 按固定比例采样节点。
-            locations = np.random.choice(graph.nodes, num * (1 + 20), replace=False)
-            # 构造主算法模型。
-            model = MultiAgentFlyingSidekickTSP(graph, locations[:num], locations[num:], distance, 3)
-            # 开始计时。
-            start = time.time()
-            # 求解当前实例。
-            _, cost = model.solve()
-            # 保存耗时。
-            times[-1].append(time.time() - start)
-            # 保存成本。
-            costs[-1].append(cost)
-    # 保存耗时结果。
-    _save_array(MANHATTAN_DATA_DIR / 'rates-time.npy', times)
-    # 保存成本结果。
-    _save_array(MANHATTAN_DATA_DIR / 'rates-cost.npy', costs)
+#     实现逻辑：
+#     1. 枚举不同客户规模。
+#     2. 对每个规模运行 `solve_multiple_drones`。
+#     3. 保存每个规模下不同无人机数量的成本结果。
+#     """
+#     # 打印实验主题。
+#     print('studying the effect of drone number')
+#     # 用于汇总所有规模的成本矩阵。
+#     all_costs = []
+#     # 枚举客户规模。
+#     for size in range(50, 160, 20):
+#         # 生成当前规模的 Manhattan 实例。
+#         graph, depots, cities, distance = multiagent_instance_on_manhattan(10, 5, size)
+#         # 存放当前规模下所有样本的成本。
+#         costs, times = [], []
+#         # 遍历 100 个随机实例。
+#         for i in tqdm(range(100)):
+#             # 构造主算法模型，初始无人机数给 0，随后由 `solve_multiple_drones` 枚举。
+#             model = MultiAgentFlyingSidekickTSP(graph, depots[i], cities[i], distance, 0)
+#             # 求出 0~5 架无人机对应的成本序列。
+#             cost = model.solve_multiple_drones()
+#             # 保存当前实例结果。
+#             costs.append(cost.copy())
+#         # 将当前规模的结果转为数组并加入总表。
+#         all_costs.append(np.array(costs))
+#         # 打印当前规模下的平均成本。
+#         print(f'size {size} gives {np.mean(costs, axis=0)}')
+#     # 将总结果保存到磁盘。
+#     _save_array(MANHATTAN_DATA_DIR / 'k-cost.npy', np.array(all_costs, dtype=float))
 
 
-def scale_depots():
-    """
-    固定客户数量，研究仓库数量增长时主算法的可扩展性。
+# def scale_cities():
+#     """
+#     固定仓库数量，研究客户数量增长时主算法的可扩展性。
 
-    输入：
-    - 无显式输入，内部固定客户数为 150。
+#     输入：
+#     - 无显式输入，内部固定使用 Manhattan 路网。
 
-    输出：
-    - 保存耗时到 `depots-time.npy`。
-    - 保存成本到 `depots-cost.npy`。
+#     输出：
+#     - 保存耗时到 `city-time.npy`。
+#     - 保存成本到 `city-cost.npy`。
 
-    实现逻辑：
-    1. 读取 Manhattan 路网。
-    2. 枚举仓库数。
-    3. 固定客户数 150，重复采样并统计性能。
-    """
-    # 打印实验主题。
-    print('studying the scalability of fix cities case')
-    # 读取 Manhattan 路网。
-    graph = manhattan()
-    # 距离工厂命中前两类实验的 H2H 缓存，不再按实验重复物化矩阵。
-    distance = build_distance_provider(
-        graph,
-        dataset_name=graph.graph.get('dataset_name', 'nyc'),
-        graph_path=graph.graph.get('source_path'),
-    )
-    # 初始化成本和耗时容器。
-    costs, times = [], []
-    # 枚举仓库数量。
-    for num in range(5, 16, 2):
-        # 为当前规模开辟成本列表。
-        costs.append([])
-        # 为当前规模开辟耗时列表。
-        times.append([])
-        # 重复 100 次随机采样。
-        for _ in tqdm(range(100)):
-            # 随机采样仓库与客户。
-            locations = np.random.choice(graph.nodes, num + 150, replace=False)
-            # 构造主算法模型。
-            model = MultiAgentFlyingSidekickTSP(graph, locations[:num], locations[num:], distance, 3)
-            # 开始计时。
-            start = time.time()
-            # 求解当前实例。
-            _, cost = model.solve()
-            # 保存耗时。
-            times[-1].append(time.time() - start)
-            # 保存成本。
-            costs[-1].append(cost)
-    # 保存耗时结果。
-    _save_array(MANHATTAN_DATA_DIR / 'depots-time.npy', times)
-    # 保存成本结果。
-    _save_array(MANHATTAN_DATA_DIR / 'depots-cost.npy', costs)
+#     实现逻辑：
+#     1. 先构造 Manhattan 路网和距离矩阵。
+#     2. 枚举不同客户数量。
+#     3. 每个数量下重复采样并统计性能。
+#     """
+#     # 打印实验主题。
+#     print('studying the scalability of fix depot case')
+#     # 读取 Manhattan 路网。
+#     graph = manhattan()
+#     # 三类规模实验共享同一图哈希 H2H 缓存，无人机距离保持按需计算。
+#     distance = build_distance_provider(
+#         graph,
+#         dataset_name=graph.graph.get('dataset_name', 'nyc'),
+#         graph_path=graph.graph.get('source_path'),
+#     )
+#     # 初始化成本和耗时容器。
+#     costs, times = [], []
+#     # 枚举客户数量。
+#     for num in range(120, 350, 40):
+#         # 为当前规模开辟成本列表。
+#         costs.append([])
+#         # 为当前规模开辟耗时列表。
+#         times.append([])
+#         # 重复 100 次随机采样。
+#         for _ in tqdm(range(100)):
+#             # 从图节点中随机采样仓库和客户。
+#             locations = np.random.choice(graph.nodes, num + 10, replace=False)
+#             # 构造主算法模型。
+#             model = MultiAgentFlyingSidekickTSP(graph, locations[:10], locations[10:], distance, 3)
+#             # 开始计时。
+#             start = time.time()
+#             # 求解当前实例。
+#             _, cost = model.solve()
+#             # 保存耗时。
+#             times[-1].append(time.time() - start)
+#             # 保存成本。
+#             costs[-1].append(cost)
+#     # 保存耗时结果。
+#     _save_array(MANHATTAN_DATA_DIR / 'city-time.npy', times)
+#     # 保存成本结果。
+#     _save_array(MANHATTAN_DATA_DIR / 'city-cost.npy', costs)
 
 
-def run_demo_experiments():
-    """
-    运行离线轻量级演示实验。
+# def scale_rates():
+#     """
+#     固定客户与仓库比例，研究规模增长时主算法的可扩展性。
 
-    输入：
-    - 无显式输入。
+#     输入：
+#     - 无显式输入，内部固定客户仓库比例为 20:1。
 
-    输出：
-    - 无返回值，直接打印三个小规模案例的实验结果。
+#     输出：
+#     - 保存耗时到 `rates-time.npy`。
+#     - 保存成本到 `rates-cost.npy`。
 
-    实现逻辑：
-    1. 构造一个小型子图案例。
-    2. 构造一个合成 Manhattan 案例。
-    3. 构造一个合成 Cambridge 案例。
-    """
-    # 打印演示模式提示。
-    print('Running a lightweight demo suite.')
-    # 提示如何切换到论文全量实验。
-    print('Set RUN_FULL_EXPERIMENTS=True in config.py if you want the paper-scale experiments.')
-    # 构造小型子图案例。
-    graph, depots, cities, distance = small_instance(1, 10, 2, 3)
-    # 运行小型子图案例。
-    result = run_quick_case('Small synthetic subset', graph, depots[0], cities[0], distance, 2, hc_rounds=80)
-    _save_npz(SMALL_DATA_DIR / 'quick-small-subset.npz', **result)
+#     实现逻辑：
+#     1. 读取 Manhattan 路网。
+#     2. 枚举仓库数量。
+#     3. 按照固定比例同时增加客户数量。
+#     """
+#     # 打印实验主题。
+#     print('studying the scalability of fix rates case')
+#     # 读取 Manhattan 路网。
+#     graph = manhattan()
+#     # 使用与其他规模实验相同的数据集名，确保只构建一份版本化索引。
+#     distance = build_distance_provider(
+#         graph,
+#         dataset_name=graph.graph.get('dataset_name', 'nyc'),
+#         graph_path=graph.graph.get('source_path'),
+#     )
+#     # 初始化成本和耗时容器。
+#     costs, times = [], []
+#     # 枚举仓库数。
+#     for num in range(3, 21, 3):
+#         # 为当前规模开辟成本列表。
+#         costs.append([])
+#         # 为当前规模开辟耗时列表。
+#         times.append([])
+#         # 重复 100 次随机采样。
+#         for _ in tqdm(range(100)):
+#             # 按固定比例采样节点。
+#             locations = np.random.choice(graph.nodes, num * (1 + 20), replace=False)
+#             # 构造主算法模型。
+#             model = MultiAgentFlyingSidekickTSP(graph, locations[:num], locations[num:], distance, 3)
+#             # 开始计时。
+#             start = time.time()
+#             # 求解当前实例。
+#             _, cost = model.solve()
+#             # 保存耗时。
+#             times[-1].append(time.time() - start)
+#             # 保存成本。
+#             costs[-1].append(cost)
+#     # 保存耗时结果。
+#     _save_array(MANHATTAN_DATA_DIR / 'rates-time.npy', times)
+#     # 保存成本结果。
+#     _save_array(MANHATTAN_DATA_DIR / 'rates-cost.npy', costs)
 
-    # 构造 Manhattan 局部路网案例。
-    graph, depots, cities, distance = small_instance(1, 80, 3, 6)
-    # 运行 Manhattan 案例。
-    result = run_quick_case('Local Manhattan road subset', graph, depots[0], cities[0], distance, 3, hc_rounds=80)
-    _save_npz(MANHATTAN_DATA_DIR / 'quick-road-subset.npz', **result)
 
-    # 构造 Boston/Cambridge 路网案例。
-    graph, depots, cities, distance = multiagent_instance_on_cambridge(1, 2, 3)
-    # 运行 Boston/Cambridge 案例。
-    result = run_quick_case('Boston road instance', graph, depots[0], cities[0], distance, 2, hc_rounds=40)
-    _save_npz(BOSTON_DATA_DIR / 'quick-road-instance.npz', **result)
+# def scale_depots():
+#     """
+#     固定客户数量，研究仓库数量增长时主算法的可扩展性。
+
+#     输入：
+#     - 无显式输入，内部固定客户数为 150。
+
+#     输出：
+#     - 保存耗时到 `depots-time.npy`。
+#     - 保存成本到 `depots-cost.npy`。
+
+#     实现逻辑：
+#     1. 读取 Manhattan 路网。
+#     2. 枚举仓库数。
+#     3. 固定客户数 150，重复采样并统计性能。
+#     """
+#     # 打印实验主题。
+#     print('studying the scalability of fix cities case')
+#     # 读取 Manhattan 路网。
+#     graph = manhattan()
+#     # 距离工厂命中前两类实验的 H2H 缓存，不再按实验重复物化矩阵。
+#     distance = build_distance_provider(
+#         graph,
+#         dataset_name=graph.graph.get('dataset_name', 'nyc'),
+#         graph_path=graph.graph.get('source_path'),
+#     )
+#     # 初始化成本和耗时容器。
+#     costs, times = [], []
+#     # 枚举仓库数量。
+#     for num in range(5, 16, 2):
+#         # 为当前规模开辟成本列表。
+#         costs.append([])
+#         # 为当前规模开辟耗时列表。
+#         times.append([])
+#         # 重复 100 次随机采样。
+#         for _ in tqdm(range(100)):
+#             # 随机采样仓库与客户。
+#             locations = np.random.choice(graph.nodes, num + 150, replace=False)
+#             # 构造主算法模型。
+#             model = MultiAgentFlyingSidekickTSP(graph, locations[:num], locations[num:], distance, 3)
+#             # 开始计时。
+#             start = time.time()
+#             # 求解当前实例。
+#             _, cost = model.solve()
+#             # 保存耗时。
+#             times[-1].append(time.time() - start)
+#             # 保存成本。
+#             costs[-1].append(cost)
+#     # 保存耗时结果。
+#     _save_array(MANHATTAN_DATA_DIR / 'depots-time.npy', times)
+#     # 保存成本结果。
+#     _save_array(MANHATTAN_DATA_DIR / 'depots-cost.npy', costs)
+
+
+# def run_demo_experiments():
+#     """
+#     运行离线轻量级演示实验。
+
+#     输入：
+#     - 无显式输入。
+
+#     输出：
+#     - 无返回值，直接打印三个小规模案例的实验结果。
+
+#     实现逻辑：
+#     1. 构造一个小型子图案例。
+#     2. 构造一个合成 Manhattan 案例。
+#     3. 构造一个合成 Cambridge 案例。
+#     """
+#     # 打印演示模式提示。
+#     print('Running a lightweight demo suite.')
+#     # 提示如何切换到论文全量实验。
+#     print('Set RUN_FULL_EXPERIMENTS=True in config.py if you want the paper-scale experiments.')
+#     # 构造小型子图案例。
+#     graph, depots, cities, distance = small_instance(1, 10, 2, 3)
+#     # 运行小型子图案例。
+#     result = run_quick_case('Small synthetic subset', graph, depots[0], cities[0], distance, 2, hc_rounds=80)
+#     _save_npz(SMALL_DATA_DIR / 'quick-small-subset.npz', **result)
+
+#     # 构造 Manhattan 局部路网案例。
+#     graph, depots, cities, distance = small_instance(1, 80, 3, 6)
+#     # 运行 Manhattan 案例。
+#     result = run_quick_case('Local Manhattan road subset', graph, depots[0], cities[0], distance, 3, hc_rounds=80)
+#     _save_npz(MANHATTAN_DATA_DIR / 'quick-road-subset.npz', **result)
+
+#     # 构造 Boston/Cambridge 路网案例。
+#     graph, depots, cities, distance = multiagent_instance_on_cambridge(1, 2, 3)
+#     # 运行 Boston/Cambridge 案例。
+#     result = run_quick_case('Boston road instance', graph, depots[0], cities[0], distance, 2, hc_rounds=40)
+#     _save_npz(BOSTON_DATA_DIR / 'quick-road-instance.npz', **result)
 
 
 def run_full_experiments():
@@ -1029,6 +1029,6 @@ if __name__ == '__main__':
     if RUN_FULL_EXPERIMENTS:
         # 执行论文全量实验。
         run_full_experiments()
-    else:
-        # 否则执行离线演示实验。
-        run_demo_experiments()
+    # else:
+    #     # 否则执行离线演示实验。
+    #     run_demo_experiments()
