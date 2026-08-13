@@ -10,12 +10,21 @@
 
 # 导入 `sys`，保留给潜在的命令行扩展使用。
 import sys
+# 导入 CSV 与 JSON，用于保存剪枝消融的逐仓库扁平记录。
+import csv
+import json
+# 导入数学工具，用于阻止非有限目标值进入正确性比较。
+import math
 # 导入日期时间工具，用运行开始时间生成不会覆盖旧结果的文件名。
 from datetime import datetime
 # 导入路径工具，用传入的 GraphML 文件名生成稳定的地图标识。
 from pathlib import Path
 # 导入论文主算法。
 from src.fstsp import MultiAgentFlyingSidekickTSP
+# 导入仅替换 Phase 2 的剪枝算法入口。
+from src.fstsp_pruned import PrunedMultiAgentFlyingSidekickTSP
+# 导入剪枝分组与统一 Gurobi 求解配置。
+from src.pruning import PruningOptions, SetTSPSolverOptions
 # 导入实例构造函数与 Manhattan 路网读取函数。   
 from problem import small_instance, multiagent_instance_on_manhattan, multiagent_instance_on_cambridge, manhattan
 # 导入 `numpy`，用于均值、数组保存与随机采样。
@@ -26,7 +35,7 @@ import time
 from tqdm import tqdm
 # 导入统一距离工厂，规模实验禁止再构造全对嵌套字典。
 from src.distance.distance_oracle import build_distance_provider
-from config import RUN_FULL_EXPERIMENTS
+from config import RESULTS_DIR
 from utils import ensure_dir, result_path
 from experiment_results import (
     _save_npz,
@@ -788,42 +797,7 @@ def test_manhattan_11k(num, size):
 #     _save_array(MANHATTAN_DATA_DIR / 'depots-cost.npy', costs)
 
 
-# def run_demo_experiments():
-#     """
-#     运行离线轻量级演示实验。
 
-#     输入：
-#     - 无显式输入。
-
-#     输出：
-#     - 无返回值，直接打印三个小规模案例的实验结果。
-
-#     实现逻辑：
-#     1. 构造一个小型子图案例。
-#     2. 构造一个合成 Manhattan 案例。
-#     3. 构造一个合成 Cambridge 案例。
-#     """
-#     # 打印演示模式提示。
-#     print('Running a lightweight demo suite.')
-#     # 提示如何切换到论文全量实验。
-#     print('Set RUN_FULL_EXPERIMENTS=True in config.py if you want the paper-scale experiments.')
-#     # 构造小型子图案例。
-#     graph, depots, cities, distance = small_instance(1, 10, 2, 3)
-#     # 运行小型子图案例。
-#     result = run_quick_case('Small synthetic subset', graph, depots[0], cities[0], distance, 2, hc_rounds=80)
-#     _save_npz(SMALL_DATA_DIR / 'quick-small-subset.npz', **result)
-
-#     # 构造 Manhattan 局部路网案例。
-#     graph, depots, cities, distance = small_instance(1, 80, 3, 6)
-#     # 运行 Manhattan 案例。
-#     result = run_quick_case('Local Manhattan road subset', graph, depots[0], cities[0], distance, 3, hc_rounds=80)
-#     _save_npz(MANHATTAN_DATA_DIR / 'quick-road-subset.npz', **result)
-
-#     # 构造 Boston/Cambridge 路网案例。
-#     graph, depots, cities, distance = multiagent_instance_on_cambridge(1, 2, 3)
-#     # 运行 Boston/Cambridge 案例。
-#     result = run_quick_case('Boston road instance', graph, depots[0], cities[0], distance, 2, hc_rounds=40)
-#     _save_npz(BOSTON_DATA_DIR / 'quick-road-instance.npz', **result)
 
 
 def run_full_experiments():
@@ -880,11 +854,218 @@ def run_full_experiments():
     # scale_depots()
 
 
+def run_pruning_experiments(
+    num_instances=1,
+    customer_counts=(20,),
+    solver_seed=0,
+    objective_tolerance=1e-7,
+    output_dir=None,
+):
+    """在 Manhattan 1K 与 Boston 11K 路网上运行 Phase 2 剪枝消融。
+
+    输入：每个场景的实例数、客户规模序列、Gurobi 随机种子、目标一致性
+    容差和可选输出目录。
+    输出：最终 JSON 与 CSV 路径；文件包含逐场景、逐实例、逐仓库、逐实验
+    组的 Phase 2 剪枝和求解指标。
+
+    逻辑：每个“地图×客户规模”只生成一次实例，随后让 C0、P1、P3、P7
+    和 P1→P3→P7 复用完全相同的仓库、客户与距离对象。C0 先运行并作为
+    Phase 2 目标与总时间基线；任一剪枝组目标超过容差时立即保存已有记录
+    并终止，避免服务器继续产生不可用的性能结果。
+    """
+
+    if isinstance(num_instances, bool) or not isinstance(num_instances, int) or num_instances <= 0:
+        raise ValueError('剪枝实验的 num_instances 必须为正整数。')
+    normalized_customer_counts = tuple(int(value) for value in customer_counts)
+    if not normalized_customer_counts or any(value <= 0 for value in normalized_customer_counts):
+        raise ValueError('剪枝实验的 customer_counts 必须包含至少一个正整数。')
+    if not math.isfinite(float(objective_tolerance)) or objective_tolerance < 0:
+        raise ValueError('剪枝实验的 objective_tolerance 必须为有限非负数。')
+
+    # 两个服务器实验场景沿用论文复现中的仓库数、无人机数和路网文件。
+    scenarios = (
+        {
+            'name': 'manhattan_1k',
+            'map_path': MANHATTAN1k_GRAPH_PATH,
+            'depot_count': 5,
+            'drone_count': 3,
+        },
+        {
+            'name': 'boston_11k',
+            'map_path': MANHATTAN11k_GRAPH_PATH,
+            'depot_count': 10,
+            'drone_count': 4,
+        },
+    )
+    # 单项组用于测量每条规则的独立贡献，最终组按 P1→P3→P7 顺序组合。
+    pruning_groups = (
+        ('C0', PruningOptions()),
+        ('P1', PruningOptions(structural_stsp=True)),
+        ('P3', PruningOptions(assignment_bound=True)),
+        ('P7', PruningOptions(endpoint_pair_dominance=True)),
+        ('P1_P3_P7', PruningOptions.p1_p3_p7()),
+    )
+    solver_options = SetTSPSolverOptions(seed=int(solver_seed))
+    selected_output_dir = Path(output_dir) if output_dir is not None else RESULTS_DIR / 'pruning'
+    selected_output_dir.mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    json_path = selected_output_dir / f'road_pruning_{run_timestamp}.json'
+    csv_path = selected_output_dir / f'road_pruning_{run_timestamp}.csv'
+    records = []
+
+    def write_current_records():
+        """原子写入当前全部扁平记录，防止中断留下半个结果文件。"""
+
+        json_temporary = json_path.with_suffix('.json.tmp')
+        json_temporary.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding='utf-8',
+        )
+        json_temporary.replace(json_path)
+
+        csv_temporary = csv_path.with_suffix('.csv.tmp')
+        fieldnames = sorted({key for record in records for key in record})
+        with csv_temporary.open('w', encoding='utf-8-sig', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+        csv_temporary.replace(csv_path)
+
+    # 每个基线键对应同一地图、规模、实例和仓库，防止跨实例错误比较。
+    phase2_baselines = {}
+    full_cost_baselines = {}
+    for scenario in scenarios:
+        for customer_count in normalized_customer_counts:
+            print(
+                f'Preparing pruning scenario={scenario["name"]}, '
+                f'customers={customer_count}, instances={num_instances}.'
+            )
+            graph, depots, cities, distance = multiagent_instance_on_manhattan(
+                num_instances,
+                scenario['depot_count'],
+                customer_count,
+                scenario['map_path'],
+            )
+
+            for instance_index in range(num_instances):
+                for group_name, pruning_options in pruning_groups:
+                    print(
+                        f'Running pruning group={group_name}, scenario={scenario["name"]}, '
+                        f'customers={customer_count}, instance={instance_index}.'
+                    )
+                    model = PrunedMultiAgentFlyingSidekickTSP(
+                        graph,
+                        depots[instance_index],
+                        cities[instance_index],
+                        distance,
+                        scenario['drone_count'],
+                        theta=(0.5, 0.5),
+                        pruning_options=pruning_options,
+                        solver_options=solver_options,
+                    )
+                    _, full_cost, process_data = _solve_model_with_process_data(model)
+                    phase2_metrics = model.phase2_metrics()
+                    phase2_reports = model.phase2_pruning_reports
+                    active_depot_records = [
+                        item for item in process_data['depot_records'] if item['customers']
+                    ]
+                    if not (
+                        len(active_depot_records)
+                        == len(phase2_metrics)
+                        == len(phase2_reports)
+                    ):
+                        raise RuntimeError(
+                            f'{scenario["name"]}/实例 {instance_index}/{group_name} 的 '
+                            'Phase 2 仓库记录、指标和剪枝报告数量不一致。'
+                        )
+
+                    full_key = (scenario['name'], customer_count, instance_index)
+                    if group_name == 'C0':
+                        full_cost_baselines[full_key] = float(full_cost)
+                    baseline_full_cost = full_cost_baselines[full_key]
+
+                    phase2_index = 0
+                    for depot_record in process_data['depot_records']:
+                        if not depot_record['customers']:
+                            continue
+                        metrics = phase2_metrics[phase2_index]
+                        report = phase2_reports[phase2_index]
+                        phase2_index += 1
+                        objective = float(metrics['phase2_objective'])
+                        if not math.isfinite(objective):
+                            raise RuntimeError(
+                                f'{scenario["name"]}/实例 {instance_index}/{group_name}/'
+                                f'仓库 {depot_record["depot_index"]} 的 Phase 2 目标非有限。'
+                            )
+
+                        baseline_key = (
+                            scenario['name'],
+                            customer_count,
+                            instance_index,
+                            int(depot_record['depot_index']),
+                        )
+                        if group_name == 'C0':
+                            phase2_baselines[baseline_key] = {
+                                'objective': objective,
+                                'total_seconds': float(metrics['phase2_total_seconds']),
+                            }
+                        baseline = phase2_baselines[baseline_key]
+                        objective_delta = abs(objective - baseline['objective'])
+                        objective_consistent = objective_delta <= objective_tolerance
+                        phase2_total_seconds = float(metrics['phase2_total_seconds'])
+
+                        record = {
+                            'scenario': scenario['name'],
+                            'map_path': str(scenario['map_path']),
+                            'customer_count': customer_count,
+                            'instance_index': instance_index,
+                            'group': group_name,
+                            'depot_index': int(depot_record['depot_index']),
+                            'depot_node': str(depot_record['depot_node']),
+                            'assigned_customer_count': len(depot_record['customers']),
+                            'convex_set_sizes': json.dumps(depot_record['convex_set_sizes']),
+                            'set_tsp_sequence': json.dumps(depot_record['set_tsp_sequence']),
+                            'full_objective': float(full_cost),
+                            'full_objective_delta_from_c0': abs(
+                                float(full_cost) - baseline_full_cost
+                            ),
+                            'full_solve_seconds': float(process_data['solve_seconds']),
+                            'phase2_objective_delta_from_c0': objective_delta,
+                            'phase2_objective_consistent': objective_consistent,
+                            'phase2_speedup_vs_c0': (
+                                baseline['total_seconds'] / phase2_total_seconds
+                                if phase2_total_seconds > 0.0
+                                else None
+                            ),
+                        }
+                        record.update(metrics)
+                        for name, count in report.initial_counts.items():
+                            record[f'phase2_initial_{name}'] = int(count)
+                        for name, count in report.final_counts.items():
+                            record[f'phase2_final_{name}'] = int(count)
+                        records.append(record)
+
+                        if not objective_consistent:
+                            write_current_records()
+                            raise RuntimeError(
+                                f'{scenario["name"]}/实例 {instance_index}/{group_name}/'
+                                f'仓库 {depot_record["depot_index"]} 的 Phase 2 目标与 C0 '
+                                f'不一致：delta={objective_delta}，'
+                                f'tolerance={objective_tolerance}。'
+                            )
+
+                    # 每个实验组结束后立即刷新结果，服务器中断时最多损失当前组。
+                    write_current_records()
+
+    print(f'Pruning experiment JSON: {json_path}')
+    print(f'Pruning experiment CSV: {csv_path}')
+    return json_path, csv_path
+
+
 if __name__ == '__main__':
-    # 当配置显式要求全量实验时，运行完整实验。
-    if RUN_FULL_EXPERIMENTS:
-        # 执行论文全量实验。
-        run_full_experiments()
-    # else:
-    #     # 否则执行离线演示实验。
-    #     run_demo_experiments()
+    # 当前入口按用户确认直接运行 Manhattan 1K 与 Boston 11K 剪枝消融。
+    run_pruning_experiments()
+
+
+    # # 执行论文全量实验。
+    # run_full_experiments()

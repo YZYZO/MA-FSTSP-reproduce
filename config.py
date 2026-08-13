@@ -13,10 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DATASETS_DIR = PROJECT_ROOT / 'datasets'
 RESULTS_DIR = PROJECT_ROOT / 'results'
 
-# Experiment mode. Keep this False for quick local checks; set True for the
-# paper-scale experiment suite, which can take a long time on older CPUs.
-RUN_FULL_EXPERIMENTS = True
-
 # 显式地图路径；默认不允许候选路径或合成地图静默替代目标数据。
 MANHATTAN_GRAPH_PATH = DATASETS_DIR / 'nyc.graphml'
 #MANHATTAN_GRAPH_PATH = DATASETS_DIR / 'manhatten.graphml'
