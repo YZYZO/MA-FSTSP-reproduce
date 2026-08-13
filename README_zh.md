@@ -44,13 +44,7 @@ conda activate MA-FSTSP
 pip install -r requirements.txt
 ```
 
-如果你更希望严格贴近论文原始环境，也可以改成：
 
-```bash
-conda create -n MA-FSTSP python=3.7
-conda activate MA-FSTSP
-pip install -r requirements.txt
-```
 
 ## 数据说明
 论文原始代码默认依赖以下真实路网数据：
@@ -78,26 +72,6 @@ D:\Anaconda3\envs\MA-FSTSP\python.exe scripts\build_h2h_native.py --release
 
 本机 `H2H_ENABLE_55K=False` 时，选择 `datasets/nyc.graphml` 会在读取文件和启动 builder 前停止。只有约 200 GB RAM 的服务器才应显式改为 `True`；Linux 服务器需用同一脚本重新编译 `.so`。
 
-阶段 6 的本机慢速验收使用独立临时索引，不污染 `datasets/indexes/`：
-
-```powershell
-$env:H2H_RUN_LOCAL_ACCEPTANCE = "1"
-D:\Anaconda3\envs\MA-FSTSP\python.exe -m unittest tests.test_h2h_phase6_acceptance -v
-```
-
-该测试会在 4,333 和 8,313 节点标准化图上各对照 100,000 个有序节点对，并检查三条查询路径吞吐、缓存重载和两个 spawn worker。普通 `unittest discover` 会跳过这三个显式慢速项。
-
-55k 服务器验收不需要永久修改 `config.py`，而由专用脚本要求一次性的明确授权：
-
-```bash
-python scripts/run_h2h_server_acceptance.py \
-  --confirm-server-55k \
-  --compiler g++ \
-  --worker-counts 1,4,8,16 \
-  --customer-counts 20
-```
-
-脚本只允许 Linux，默认要求至少 150 GiB 物理内存；它会重编译 `.so`、构建/加载 55k 索引、完成 200 个源共 100,000 个 Dijkstra 对照、查询吞吐、worker 扩展和 5 仓库/20 客户/3 无人机端到端实例，并原子写入 `results/h2h-server-55k-acceptance.json`。首个实例通过后可用 `--customer-counts 50,100,150` 继续扩展。完整说明见 `docs/H2H_SERVER_ACCEPTANCE.md`。
 
 ## 如何运行实验
 ### 1. 运行轻量级演示实验
