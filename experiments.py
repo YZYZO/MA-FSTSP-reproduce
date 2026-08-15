@@ -26,13 +26,15 @@ import numpy as np
 import time
 # 导入进度条工具 `tqdm`。
 from tqdm import tqdm
-# 导入球面距离函数，用于构造无人机欧氏/球面距离矩阵。
-from utils import haversine
+# 导入球面距离与统一结果目录工具。
+from utils import ensure_dir, haversine, result_path
 from config import (
     MANHATTAN1k_GRAPH_PATH,
     MANHATTAN11k_GRAPH_PATH,
-    ensure_dir,
-    result_path,
+)
+from experiment_results import (
+    _save_stsp_batch_result,
+    _solve_model_with_process_data,
 )
 
 # 导入 `os`，用于读取/设置 CPU 亲和性。
@@ -52,12 +54,6 @@ def _save_array(path, array):
     np.save(path, np.array(array))
 
 
-def _save_npz(path, **arrays):
-    ensure_dir(path.parent)
-    np.savez(path, **arrays)
-
-
-    
 # 固定使用 10 个进程并行运行实例。
 PROCESS_WORKERS = 50
 # 默认把这 10 个进程限制在当前允许 CPU 集合中的前 10 个逻辑 CPU 上。
@@ -91,8 +87,11 @@ def _solve_instance_job(task):
     """
     子进程执行单个实例。
 
-    task: (algorithm, index, drones, rounds, theta)
-    返回: (index, cost, elapsed)
+    输入：
+    - task: `(algorithm, index, drones, rounds, theta)`。
+
+    输出：
+    - `(index, cost, elapsed, solution, process_data)`，包含最终路线和三阶段记录。
     """
     algorithm, i, drones, rounds, theta = task
     depots = _PAR_DEPOTS[i]
@@ -107,12 +106,14 @@ def _solve_instance_job(task):
             _PAR_GRAPH, depots, cities, _PAR_DISTANCE, drones, theta=theta
         )
 
-    start = time.time()
-    _, cost = model.solve()
-    elapsed = time.time() - start
+    if algorithm != 'stsp':
+        raise ValueError(f'当前并行实验记录器只支持 stsp，收到 algorithm={algorithm!r}')
 
+    # 使用与 `solve()` 等价的三阶段调度，同时保留绘图所需的紧凑过程数据。
+    solution, cost, process_data = _solve_model_with_process_data(model)
+    elapsed = process_data['solve_seconds']
 
-    return i, cost, elapsed
+    return i, cost, elapsed, solution, process_data
 
 
 def _run_parallel_instances(
@@ -173,15 +174,18 @@ def _run_parallel_instances(
         }
 
         for future in tqdm(as_completed(futures), total=num, desc=desc):
-            i, cost, elapsed = future.result()
-            results[i] = (cost, elapsed)
+            i, cost, elapsed, solution, process_data = future.result()
+            results[i] = (cost, elapsed, solution, process_data)
 
     return results
 
 
 def _store_cost_time(costs, times, key, results):
     """
-    将并行任务返回的 (cost, elapsed) 写回成本表和耗时表。
+    将并行任务返回记录中的 cost/elapsed 写回成本表和耗时表。
+
+    输入：成本表、耗时表、算法键和实例结果列表。
+    输出：无；只更新成本和耗时，保留路线及过程数据给结果序列化模块使用。
     """
     costs[key] = [item[0] for item in results]
     times[key] = [item[1] for item in results]
@@ -214,12 +218,15 @@ def test_manhattan(num, size):
 
     # 输出论文主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
-    _save_npz(
+    _save_stsp_batch_result(
         MANHATTAN_DATA_DIR / f'road-size-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        3,
+        costs,
+        times,
     )
 
 
@@ -247,12 +254,15 @@ def test_cambridge(num, size):
 
     # 输出主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
-    _save_npz(
+    _save_stsp_batch_result(
         BOSTON_DATA_DIR / f'road-size-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        3,
+        costs,
+        times,
     )
 
 
@@ -294,12 +304,15 @@ def test_manhattan_1k(num, size):
     # 输出本批次主算法的平均成本和平均求解时间。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
     # 结果文件命名与目标分支保持一致。
-    _save_npz(
+    _save_stsp_batch_result(
         MANHATTAN_DATA_DIR / f'{run_timestamp}-manhattan_1k-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        3,
+        costs,
+        times,
     )
 
 
@@ -341,12 +354,15 @@ def test_manhattan_11k(num, size):
     # 输出本批次主算法的平均成本和平均求解时间。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
     # 按用户要求沿用目标分支的 Boston 目录和 `boston_11k` 命名。
-    _save_npz(
+    _save_stsp_batch_result(
         BOSTON_DATA_DIR / f'{run_timestamp}-boston_11k-{size}.npz',
-        hc_cost=np.array(costs['hc']),
-        hc_time=np.array(times['hc']),
-        stsp_cost=np.array(costs['stsp']),
-        stsp_time=np.array(times['stsp']),
+        stsp_results,
+        depots,
+        cities,
+        distance,
+        4,
+        costs,
+        times,
     )
 
 

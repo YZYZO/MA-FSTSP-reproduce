@@ -23,11 +23,21 @@ To run all the experiments in the paper, you can use
 ```bash
 python experiments.py
 ```
-Project options are configured in `config.py`. Set `RUN_FULL_EXPERIMENTS=True` there to run the paper-scale suite. Boston/Cambridge OSM download is enabled by `ALLOW_OSM_DOWNLOAD=True` and uses the radius/node limits in the same file.
+The active experiment sizes are selected in `run_full_experiments()` in `experiments.py`. The 1K Manhattan reproduction uses `datasets/nyc_1024.graphml`; the Boston-scale 11K reproduction keeps the `boston_11k` result name while using `datasets/nyc_11000.graphml` as its road network.
+
+Boston/Cambridge OSM download settings are colocated with the map-loading implementation in `problem.py`. Download and refresh are disabled by default, and both switches must be enabled before the code accesses Overpass.
 To generate all the figures in the paper, you can use 
 ```bash
 python plot.py
 ```
+
+To visualize the latest saved 1K/11K solution batch without re-running the optimizer:
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -c "import plot; plot.plot_large_road_experiment_results(customer_count=100)"
+```
+
+New road-network NPZ files include the sampled depots/customers, final truck/drone routes, and compact phase telemetry. The plotting code selects the median-cost instance by default and writes an interactive HTML map plus a JSON summary.
 
 Outputs are written under `results/`:
 
