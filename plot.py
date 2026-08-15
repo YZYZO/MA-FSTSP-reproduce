@@ -104,7 +104,7 @@ LARGE_ROAD_CITY_CONFIGS = {
         'graph_loader': 'manhattan',
         'graph_path': MANHATTAN1k_GRAPH_PATH,
         'num_depots': 5,
-        'drones_per_truck': 1,
+        'drones_per_truck': 3,
     },
     'boston': {
         'label': 'Boston',
@@ -113,8 +113,8 @@ LARGE_ROAD_CITY_CONFIGS = {
         'instance_builder': 'manhattan',
         'graph_loader': 'manhattan',
         'graph_path': MANHATTAN11k_GRAPH_PATH,
-        'num_depots': 5,
-        'drones_per_truck': 1,
+        'num_depots': 10,
+        'drones_per_truck': 4,
     },
 }
 LARGE_ROAD_INSTANCE_BUILDERS = {
