@@ -24,6 +24,8 @@ import osmnx as ox
 import pickle
 # 导入 `lru_cache`，避免重复读取大型 GraphML 文件。
 from functools import lru_cache
+# 导入 `Path`，用于校验调用方显式传入的 GraphML 文件路径。
+from pathlib import Path
 # 导入球面距离函数，用于根据经纬度构造边权。
 from utils import haversine
 from config import (
@@ -343,34 +345,44 @@ def _pairwise_distance(graph):
                       for i in graph.nodes}}
 
 
-@lru_cache(maxsize=1)
-def manhattan():
+@lru_cache(maxsize=4)
+def manhattan(graph_path=None):
     """
-    读取 Manhattan 路网；若缺失真实数据，则生成合成 Manhattan 风格网格图。
+    读取指定的 Manhattan/NYC 路网，并标准化节点编号、坐标和边权。
 
     输入：
-    - 无。
+    - graph_path: 可选 GraphML 路径；省略时沿用现有 Manhattan 候选路径逻辑。
 
     输出：
     - manhattan_graph: `networkx.MultiDiGraph` 路网图。
 
     实现逻辑：
-    1. 先尝试在根目录或 `datasets/` 中寻找 Manhattan GraphML。
-    2. 若找到，则读取并标准化。
-    3. 若找不到，则构造一个规则网格作为替代。
-    4. 若曼哈顿距离缓存不存在，则额外计算并保存缓存。
+    1. 调用方传入路径时严格读取该文件，路径不存在则直接报错。
+    2. 未传入路径时，继续从历史候选位置查找默认 Manhattan 地图。
+    3. 默认地图缺失时构造规则网格，保持原有离线回退行为。
+    4. 仅对默认地图保留原有 Manhattan 距离缓存生成逻辑。
     """
-    # 在候选位置中查找真实 Manhattan 图文件。
-    graph_path = next((path for path in MANHATTAN_GRAPH_CANDIDATES if path.is_file()), None)
-    # 如果没找到真实图，就使用合成网格图。
+    # 显式路径用于 1k/11k 实验；默认调用继续采用原有候选路径优先级。
     if graph_path is None:
+        selected_graph_path = next(
+            (path for path in MANHATTAN_GRAPH_CANDIDATES if path.is_file()),
+            None,
+        )
+    else:
+        selected_graph_path = Path(graph_path)
+        if not selected_graph_path.is_file():
+            raise FileNotFoundError(
+                f'Manhattan/NYC GraphML 文件不存在：{selected_graph_path.resolve()}'
+            )
+    # 如果没找到真实图，就使用合成网格图。
+    if selected_graph_path is None:
         # 打印提示信息。
         print('Manhattan GraphML not found, using a synthetic Manhattan-style grid instance instead.')
         # 生成一个合成 Manhattan 风格网格图。
         manhattan_graph = _synthetic_grid_graph(20, 20, origin=(-73.99, 40.75), step=0.002)
     else:
         # 读取真实 GraphML 文件。
-        g = nx.MultiDiGraph(nx.read_graphml(graph_path))
+        g = nx.MultiDiGraph(nx.read_graphml(selected_graph_path))
         # 将真实图标准化为统一编号与坐标结构。
         x_key, y_key = _coordinate_keys(g)
         nodes = _largest_strong_component(g)
@@ -378,7 +390,11 @@ def manhattan():
     # 确保缓存目录存在。
     _ensure_datasets_dir()
     # 如果 Manhattan 距离缓存不存在，就创建它。
-    if not MANHATTAN_CACHE.is_file() and manhattan_graph.number_of_nodes() <= 5000:
+    if (
+        graph_path is None
+        and not MANHATTAN_CACHE.is_file()
+        and manhattan_graph.number_of_nodes() <= 5000
+    ):
         # 打印缓存构造提示。
         print('=============preparing pairwise data=================')
         # 计算所有节点对之间的最短路距离。
@@ -550,27 +566,28 @@ def small_instance(num, nodes, depots, cities):
     return subgraph, _depots, _cities, distance
 
 
-def multiagent_instance_on_manhattan(num, depots, cities):
+def multiagent_instance_on_manhattan(num, depots, cities, graph_path=None):
     """
-    在 Manhattan 路网上生成多仓库随机实例。
+    在指定的 Manhattan/NYC 路网上生成多仓库随机实例。
 
     输入：
     - num: 实例数量。
     - depots: 每个实例中的仓库数。
     - cities: 每个实例中的客户数。
+    - graph_path: 可选 GraphML 路径；省略时使用现有默认 Manhattan 地图。
 
     输出：
     - `(graph, depot_list, city_list, distance)`。
 
     实现逻辑：
-    1. 读取 Manhattan 路网。
+    1. 读取调用方指定的 Manhattan/NYC 路网，或沿用默认 Manhattan 路网。
     2. 构造图上统一的全对距离矩阵。
     3. 重复采样仓库和客户节点。
     """
     # 固定随机种子。
     np.random.seed(0)
     # 读取 Manhattan 路网。
-    graph = manhattan()
+    graph = manhattan(graph_path)
     # 预计算卡车和无人机距离。
     distance = _pairwise_distance(graph)
     # 保存每个实例的仓库集合。
