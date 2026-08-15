@@ -17,9 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DATASETS_DIR = PROJECT_ROOT / 'datasets'
 RESULTS_DIR = PROJECT_ROOT / 'results'
 
-# Experiment mode. Keep this False for quick local checks; set True for the
-# paper-scale experiment suite, which can take a long time on older CPUs.
-RUN_FULL_EXPERIMENTS = True
+
 
 # OSMnx/Boston map download settings.
 ALLOW_OSM_DOWNLOAD = True
