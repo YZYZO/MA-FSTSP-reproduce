@@ -400,11 +400,12 @@ def _build_stsp_result_arrays(
     drone_limit=1.5,
     drone_speed=1.6,
     theta=(0.5, 0.5),
+    distance_initialization_stats=None,
 ):
     """
     将一批 STSP 求解结果转换为紧凑、可直接写入 NPZ 的数组集合。
 
-    输入：全部实例结果、实例节点、距离对象和无人机参数。
+    输入：全部实例结果、实例节点、距离对象、无人机参数，以及可选的批次级距离初始化耗时。
     输出：包含全部紧凑解及 best/median/worst 详细追踪的字段字典。
     """
     if not (len(results) == len(depots) == len(cities)):
@@ -468,7 +469,7 @@ def _build_stsp_result_arrays(
         for role, instance_index in representatives
     ]
 
-    return {
+    result_arrays = {
         'result_schema_version': np.asarray(2, dtype=np.int64),
         'instance_indices': np.arange(len(results), dtype=np.int64),
         'depots': np.asarray(depots),
@@ -496,6 +497,27 @@ def _build_stsp_result_arrays(
         'representative_traces_json': _json_array(representative_traces),
     }
 
+    if distance_initialization_stats is not None:
+        # 三个标量描述整批实例共享的一次距离准备，不能扩展成逐实例数组。
+        required_fields = (
+            'truck_apsp_seconds',
+            'drone_pairwise_seconds',
+            'distance_initialization_seconds',
+        )
+        missing_fields = [
+            field for field in required_fields
+            if field not in distance_initialization_stats
+        ]
+        if missing_fields:
+            raise ValueError(f'距离初始化统计缺少字段：{missing_fields}')
+        for field in required_fields:
+            value = float(distance_initialization_stats[field])
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f'距离初始化统计 {field} 必须是非负有限数，收到 {value!r}。')
+            result_arrays[field] = np.asarray(value, dtype=float)
+
+    return result_arrays
+
 
 def _save_stsp_batch_result(
     path,
@@ -509,11 +531,13 @@ def _save_stsp_batch_result(
     drone_limit=1.5,
     drone_speed=1.6,
     theta=(0.5, 0.5),
+    distance_initialization_stats=None,
 ):
     """
     保存兼容旧统计字段并包含新路线/过程字段的一批 STSP 结果。
 
-    输入：输出路径、实例求解结果、实例输入、距离对象、参数及旧成本/耗时表。
+    输入：输出路径、实例求解结果、实例输入、距离对象、参数、旧成本/耗时表，
+    以及可选的批次级距离初始化耗时。
     输出：写入后的 `Path`，便于调用者或测试定位本批次文件。
     """
     detail_arrays = _build_stsp_result_arrays(
@@ -525,6 +549,7 @@ def _save_stsp_batch_result(
         drone_limit=drone_limit,
         drone_speed=drone_speed,
         theta=theta,
+        distance_initialization_stats=distance_initialization_stats,
     )
     # HC 字段继续保留，保证旧统计消费者仍能识别当前结果文件。
     _save_npz(

@@ -10,6 +10,8 @@
 
 # 导入 `json`，用于保存 Manhattan 的距离缓存。
 import json
+# 导入高精度单调时钟，用于统计距离初始化的墙钟耗时。
+import time
 # 导入 `networkx`，用于图构建与最短路计算。
 import networkx as nx
 # 导入 `numpy`，用于随机采样和数组处理。
@@ -28,6 +30,8 @@ from functools import lru_cache
 from pathlib import Path
 # 导入球面距离函数，用于根据经纬度构造边权。
 from utils import haversine
+# 导入进度条，展示全点对距离初始化的源节点处理进度。
+from tqdm import tqdm
 from config import (
     DATASETS_DIR,
     PROJECT_ROOT,
@@ -334,26 +338,82 @@ def _synthetic_grid_graph(rows, cols, origin, step):
     return graph
 
 
-def _pairwise_distance(graph):
+def _pairwise_distance(graph, return_stats=False, show_progress=True):
     """
     为给定路网一次性构造卡车与无人机的全对距离矩阵。
 
     输入：
     - graph: 路网图。
+    - return_stats: 是否在距离字典之外返回初始化耗时统计。
+    - show_progress: 是否显示卡车与无人机距离构造进度条。
 
     输出：
-    - 一个字典：
+    - 默认返回一个字典：
       - `truck`: 路网最短路距离。
       - `drone`: 节点间球面直线距离。
+    - `return_stats=True` 时返回 `(distance, stats)`，附带三个墙钟耗时字段。
 
     实现逻辑：
     1. 用 Dijkstra 计算卡车在路网上的全对最短路。
     2. 用 `haversine` 计算无人机的节点间直线距离。
+    3. 以源节点为进度单位显示两个阶段，并分别记录耗时。
     """
-    # 返回包含卡车距离和无人机距离的字典。
-    return {'truck': dict(nx.all_pairs_dijkstra_path_length(graph, weight='weight')),
-            'drone': {i: {j: haversine(graph.nodes[i]['pos'], graph.nodes[j]['pos']) for j in graph.nodes}
-                      for i in graph.nodes}}
+    # 固化节点顺序，使两个进度条的总量与实际源节点数保持一致。
+    nodes = list(graph.nodes)
+    node_count = len(nodes)
+    total_start = time.perf_counter()
+
+    # 卡车阶段每完成一个源节点的单源 Dijkstra，进度前进一步。
+    truck_start = time.perf_counter()
+    truck_rows = nx.all_pairs_dijkstra_path_length(graph, weight='weight')
+    if show_progress:
+        truck_rows = tqdm(
+            truck_rows,
+            total=node_count,
+            desc='Truck all-pairs Dijkstra',
+            unit='source',
+        )
+    truck_distance = dict(truck_rows)
+    truck_apsp_seconds = time.perf_counter() - truck_start
+
+    # 无人机阶段仍按原 haversine 语义物化矩阵，仅为外层源节点增加进度。
+    drone_start = time.perf_counter()
+    drone_sources = nodes
+    if show_progress:
+        drone_sources = tqdm(
+            nodes,
+            total=node_count,
+            desc='Drone all-pairs distance',
+            unit='source',
+        )
+    drone_distance = {
+        source: {
+            target: haversine(graph.nodes[source]['pos'], graph.nodes[target]['pos'])
+            for target in nodes
+        }
+        for source in drone_sources
+    }
+    drone_pairwise_seconds = time.perf_counter() - drone_start
+
+    # 总计时不包含地图读取和随机实例采样，只覆盖距离矩阵初始化。
+    distance_initialization_seconds = time.perf_counter() - total_start
+    stats = {
+        'truck_apsp_seconds': truck_apsp_seconds,
+        'drone_pairwise_seconds': drone_pairwise_seconds,
+        'distance_initialization_seconds': distance_initialization_seconds,
+    }
+    print(
+        'Pairwise distance initialization finished: '
+        f'truck={truck_apsp_seconds:.3f}s, '
+        f'drone={drone_pairwise_seconds:.3f}s, '
+        f'total={distance_initialization_seconds:.3f}s.'
+    )
+
+    # 默认返回值保持兼容；实验入口可以显式取得批次级统计。
+    distance = {'truck': truck_distance, 'drone': drone_distance}
+    if return_stats:
+        return distance, stats
+    return distance
 
 
 @lru_cache(maxsize=4)
@@ -577,7 +637,14 @@ def small_instance(num, nodes, depots, cities):
     return subgraph, _depots, _cities, distance
 
 
-def multiagent_instance_on_manhattan(num, depots, cities, graph_path=None):
+def multiagent_instance_on_manhattan(
+    num,
+    depots,
+    cities,
+    graph_path=None,
+    return_distance_stats=False,
+    show_distance_progress=True,
+):
     """
     在指定的 Manhattan/NYC 路网上生成多仓库随机实例。
 
@@ -586,9 +653,12 @@ def multiagent_instance_on_manhattan(num, depots, cities, graph_path=None):
     - depots: 每个实例中的仓库数。
     - cities: 每个实例中的客户数。
     - graph_path: 可选 GraphML 路径；省略时使用现有默认 Manhattan 地图。
+    - return_distance_stats: 是否额外返回全点对距离初始化耗时。
+    - show_distance_progress: 是否显示全点对距离初始化进度条。
 
     输出：
-    - `(graph, depot_list, city_list, distance)`。
+    - 默认返回 `(graph, depot_list, city_list, distance)`。
+    - 请求初始化统计时，在末尾追加 `distance_stats`。
 
     实现逻辑：
     1. 读取调用方指定的 Manhattan/NYC 路网，或沿用默认 Manhattan 路网。
@@ -599,8 +669,16 @@ def multiagent_instance_on_manhattan(num, depots, cities, graph_path=None):
     np.random.seed(0)
     # 读取 Manhattan 路网。
     graph = manhattan(graph_path)
-    # 预计算卡车和无人机距离。
-    distance = _pairwise_distance(graph)
+    # 预计算卡车和无人机距离；1K/11K 实验会显式请求批次级耗时。
+    distance_result = _pairwise_distance(
+        graph,
+        return_stats=return_distance_stats,
+        show_progress=show_distance_progress,
+    )
+    if return_distance_stats:
+        distance, distance_stats = distance_result
+    else:
+        distance = distance_result
     # 保存每个实例的仓库集合。
     _depots, _cities = [], []
     # 重复采样 `num` 次。
@@ -613,7 +691,9 @@ def multiagent_instance_on_manhattan(num, depots, cities, graph_path=None):
         _depots.append(locations[:depots])
         # 保存当前实例的客户集合。
         _cities.append(locations[depots:])
-    # 返回路网与采样结果。
+    # 默认保持历史四元组接口；实验计时模式额外返回初始化统计。
+    if return_distance_stats:
+        return graph, _depots, _cities, distance, distance_stats
     return graph, _depots, _cities, distance
 
 

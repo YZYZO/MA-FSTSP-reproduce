@@ -55,7 +55,7 @@ def _save_array(path, array):
 
 
 # 固定使用 10 个进程并行运行实例。
-PROCESS_WORKERS = 50
+PROCESS_WORKERS = 1
 # 默认把这 10 个进程限制在当前允许 CPU 集合中的前 10 个逻辑 CPU 上。
 # 如果只想限制进程数、不想绑定 CPU，可改为 False。
 PIN_TO_PROCESS_CORES = True
@@ -191,6 +191,24 @@ def _store_cost_time(costs, times, key, results):
     times[key] = [item[1] for item in results]
 
 
+def _print_distance_initialization_stats(label, stats):
+    '''
+    输出一批路网实验的全点对距离初始化耗时。
+
+    输入：数据集显示名称和批次级耗时字典。
+    输出：无；打印卡车、无人机和总初始化耗时。
+    '''
+    print(
+        '{} distance initialization: truck APSP={:.3f}s, '
+        'drone pairwise={:.3f}s, total={:.3f}s.'.format(
+            label,
+            stats['truck_apsp_seconds'],
+            stats['drone_pairwise_seconds'],
+            stats['distance_initialization_seconds'],
+        )
+    )
+
+
 
 
 
@@ -285,9 +303,15 @@ def test_manhattan_1k(num, size):
     # 秒级时间戳用于避免相同客户规模的不同实验批次互相覆盖。
     run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     # 中型 Manhattan 论文场景固定为 5 个仓库，并显式选择 1,024 节点地图。
-    graph, depots, cities, distance = multiagent_instance_on_manhattan(
-        num, 5, size, MANHATTAN1k_GRAPH_PATH
+    graph, depots, cities, distance, distance_stats = multiagent_instance_on_manhattan(
+        num,
+        5,
+        size,
+        MANHATTAN1k_GRAPH_PATH,
+        return_distance_stats=True,
     )
+    # 距离矩阵由本批次全部实例共享，因此初始化耗时只报告和保存一次。
+    _print_distance_initialization_stats('Manhattan 1K', distance_stats)
     # 保持与现有路网实验相同的结果结构；HC 和 LP 在当前分支不执行。
     costs = {'hc': [], 'stsp': [], 'lp': []}
     times = {'hc': [], 'stsp': [], 'lp': []}
@@ -313,6 +337,7 @@ def test_manhattan_1k(num, size):
         3,
         costs,
         times,
+        distance_initialization_stats=distance_stats,
     )
 
 
@@ -335,9 +360,15 @@ def test_manhattan_11k(num, size):
     # 秒级时间戳用于避免相同客户规模的不同实验批次互相覆盖。
     run_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     # 该 NYC 地图仅替代 Boston 的路网规模，仓库数量仍采用论文大型场景参数。
-    graph, depots, cities, distance = multiagent_instance_on_manhattan(
-        num, 10, size, MANHATTAN11k_GRAPH_PATH
+    graph, depots, cities, distance, distance_stats = multiagent_instance_on_manhattan(
+        num,
+        10,
+        size,
+        MANHATTAN11k_GRAPH_PATH,
+        return_distance_stats=True,
     )
+    # 11K NYC 替代图继续按 Boston 实验口径命名，初始化耗时按批次记录一次。
+    _print_distance_initialization_stats('Boston 11K', distance_stats)
     # 保持与现有路网实验相同的结果结构；HC 和 LP 在当前分支不执行。
     costs = {'hc': [], 'stsp': [], 'lp': []}
     times = {'hc': [], 'stsp': [], 'lp': []}
@@ -363,6 +394,7 @@ def test_manhattan_11k(num, size):
         4,
         costs,
         times,
+        distance_initialization_stats=distance_stats,
     )
 
 
