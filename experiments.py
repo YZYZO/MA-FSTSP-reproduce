@@ -17,6 +17,8 @@ from datetime import datetime
 
 # 导入论文主算法。
 from src.fstsp import MultiAgentFlyingSidekickTSP
+from src.mst_improvement.experiment_support import save_records, solve_variant
+from src.mst_improvement.model import MSTImprovementConfig
 
 # 导入实例构造函数与 Manhattan 路网读取函数。   
 from problem import small_instance, multiagent_instance_on_manhattan, multiagent_instance_on_cambridge, manhattan
@@ -47,6 +49,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 SMALL_DATA_DIR = result_path('small', 'data')
 MANHATTAN_DATA_DIR = result_path('manhattan', 'data')
 BOSTON_DATA_DIR = result_path('boston', 'data')
+MST_IMPROVEMENT_DATA_DIR = result_path('mst_improvement')
 
 
 def _save_array(path, array):
@@ -690,6 +693,248 @@ def test_manhattan_11k(num, size):
 
 
 
+def _mst_improvement_variants():
+    '''
+    构造 MST 改进实验的五个固定消融变体。
+
+    输入：无。
+    输出：算法名称与可选改进配置组成的列表。
+    '''
+    # 快速模式每轮只高保真评价 3 个候选，最多接受 5 轮改进。
+    common = {
+        'symmetrization': 'mean',
+        'exact_candidate_count': 3,
+        'max_iterations': 5,
+        'time_limit_seconds': 60.0,
+    }
+    return [
+        ('original_set_mst', None),
+        ('corrected_set_mst', MSTImprovementConfig(
+            partition_method='corrected_mst',
+            enable_relocate=False,
+            enable_swap=False,
+            **common,
+        )),
+        ('rooted_set_msf', MSTImprovementConfig(
+            partition_method='rooted_msf',
+            enable_relocate=False,
+            enable_swap=False,
+            **common,
+        )),
+        ('rooted_msf_relocate', MSTImprovementConfig(
+            partition_method='rooted_msf',
+            enable_relocate=True,
+            enable_swap=False,
+            **common,
+        )),
+        ('rooted_msf_relocate_swap', MSTImprovementConfig(
+            partition_method='rooted_msf',
+            enable_relocate=True,
+            enable_swap=True,
+            **common,
+        )),
+    ]
+
+
+def _mst_improvement_maps():
+    '''
+    构造 MST 改进实验使用的真实路网配置。
+
+    输入：无。
+    输出：地图标识到图文件、显示名称、仓库数和无人机数的映射。
+
+    参数沿用仓库现有的 1K 与 11K 路网实验，确保本实验只改变第一阶段
+    客户划分方法，不改变原算法的距离计算和车辆配置。
+    '''
+    return {
+        'manhattan_1k': {
+            'display_name': 'Manhattan 1K',
+            'graph_path': MANHATTAN1k_GRAPH_PATH,
+            'depot_count': 5,
+            'drones': 3,
+        },
+        'nyc_11k': {
+            'display_name': 'NYC 11K',
+            'graph_path': MANHATTAN11k_GRAPH_PATH,
+            'depot_count': 10,
+            'drones': 4,
+        },
+    }
+
+
+def run_mst_improvement_experiments(
+    instance_count=20,
+    customer_counts=(50, 100, 150),
+    map_names=('manhattan_1k', 'nyc_11k'),
+):
+    '''
+    在 1K/11K 真实路网上比较原始 Set-MST 与四个独立改进变体。
+
+    输入：每组实例数、客户规模序列以及需要运行的地图标识序列。
+    输出：每张地图对应的 JSON 和 NPZ 检查点路径字典。
+
+    实现逻辑：
+    1. 使用原始全点对距离实现分别读取 1K 和 11K 地图。
+    2. 同一地图、规模和实例的五种算法共享完全相同的采样与距离矩阵。
+    3. 每完成一个实例就覆盖更新该地图的检查点文件。
+    4. 按地图分别汇总，依次隔离有向修正、超级根 MSF、relocate 和 swap。
+    '''
+    if instance_count <= 0:
+        raise ValueError('instance_count 必须大于 0。')
+
+    customer_counts = tuple(int(count) for count in customer_counts)
+    if not customer_counts or any(count <= 0 for count in customer_counts):
+        raise ValueError('customer_counts 必须包含至少一个正整数。')
+
+    variants = _mst_improvement_variants()
+    map_configs = _mst_improvement_maps()
+    unknown_maps = [name for name in map_names if name not in map_configs]
+    if unknown_maps:
+        raise ValueError('未知 MST 实验地图：{}。'.format(unknown_maps))
+
+    theta = (0.5, 0.5)
+    run_id = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    paths_by_map = {}
+
+    for map_name in map_names:
+        map_config = map_configs[map_name]
+        map_records = []
+        settings = {
+            'run_id': run_id,
+            'map_name': map_name,
+            'map_display_name': map_config['display_name'],
+            'graph_path': str(map_config['graph_path']),
+            'instance_count': int(instance_count),
+            'customer_counts': list(customer_counts),
+            'depot_count': int(map_config['depot_count']),
+            'drones': int(map_config['drones']),
+            'theta': list(theta),
+            'sampling_seed': 0,
+            'distance_backend': 'original_all_pairs',
+            'variants': [name for name, _ in variants],
+            # 每个客户规模都会按原始实现独立初始化整张地图的距离矩阵。
+            'distance_initialization_stats_by_customer_count': {},
+        }
+        map_output_directory = ensure_dir(MST_IMPROVEMENT_DATA_DIR / map_name)
+
+        for customer_count in customer_counts:
+            graph, depot_batches, city_batches, distance, distance_stats = (
+                multiagent_instance_on_manhattan(
+                    instance_count,
+                    map_config['depot_count'],
+                    customer_count,
+                    map_config['graph_path'],
+                    return_distance_stats=True,
+                )
+            )
+            _print_distance_initialization_stats(
+                map_config['display_name'], distance_stats
+            )
+            settings['graph_nodes'] = int(graph.number_of_nodes())
+            settings['graph_edges'] = int(graph.number_of_edges())
+            settings['distance_initialization_stats_by_customer_count'][
+                str(customer_count)
+            ] = distance_stats
+
+            print(
+                'Running MST improvement: map={}, customers={}, instances={}, '
+                'variants={}.'.format(
+                    map_config['display_name'],
+                    customer_count,
+                    instance_count,
+                    len(variants),
+                )
+            )
+            for instance_index in range(instance_count):
+                instance_records = []
+                for variant_name, improvement_config in variants:
+                    record = solve_variant(
+                        variant_name,
+                        graph,
+                        depot_batches[instance_index],
+                        city_batches[instance_index],
+                        distance,
+                        map_config['drones'],
+                        theta,
+                        improvement_config,
+                    )
+                    record.update({
+                        'map_name': map_name,
+                        'map_display_name': map_config['display_name'],
+                        'graph_path': str(map_config['graph_path']),
+                        'graph_nodes': int(graph.number_of_nodes()),
+                        'graph_edges': int(graph.number_of_edges()),
+                        'distance_backend': 'original_all_pairs',
+                        'distance_initialization_seconds': float(
+                            distance_stats['distance_initialization_seconds']
+                        ),
+                        'depot_count': int(map_config['depot_count']),
+                        'drones': int(map_config['drones']),
+                        'customer_count': int(customer_count),
+                        'instance_index': int(instance_index),
+                    })
+                    instance_records.append(record)
+
+                # 原始 Set-MST 始终位于第一项，作为所有相对变化的共同基准。
+                baseline_cost = instance_records[0]['cost']
+                for record in instance_records:
+                    record['relative_cost_change_percent'] = (
+                        (record['cost'] - baseline_cost) / baseline_cost * 100.0
+                        if baseline_cost != 0 else 0.0
+                    )
+                    map_records.append(record)
+                    print(
+                        '  instance={} variant={} cost={:.6f} change={:+.2f}% '
+                        'partition_change={:+.2f}% time={:.3f}s groups={}'.format(
+                            instance_index,
+                            record['variant'],
+                            record['cost'],
+                            record['relative_cost_change_percent'],
+                            record['partition_cost_change_percent'],
+                            record['elapsed_seconds'],
+                            record['group_sizes'],
+                        )
+                    )
+
+                # 一整个实例的五个变体完成后更新同一检查点，保证记录成组出现。
+                paths_by_map[map_name] = save_records(
+                    map_output_directory,
+                    settings,
+                    map_records,
+                    run_id=run_id,
+                )
+
+            # 当前规模完成后释放大图和全点对距离，避免跨规模同时常驻内存。
+            del graph, depot_batches, city_batches, distance
+
+        print('{} MST improvement summary:'.format(map_config['display_name']))
+        for variant_name, _ in variants:
+            selected = [
+                record for record in map_records
+                if record['variant'] == variant_name
+            ]
+            print(
+                '  {}: mean_cost={:.6f}, mean_time={:.3f}s, '
+                'mean_change={:+.2f}%'.format(
+                    variant_name,
+                    float(np.mean([record['cost'] for record in selected])),
+                    float(np.mean([
+                        record['elapsed_seconds'] for record in selected
+                    ])),
+                    float(np.mean([
+                        record['relative_cost_change_percent']
+                        for record in selected
+                    ])),
+                )
+            )
+
+        paths = paths_by_map[map_name]
+        print('{} JSON saved to {}.'.format(map_config['display_name'], paths['json']))
+        print('{} NPZ saved to {}.'.format(map_config['display_name'], paths['npz']))
+
+    return paths_by_map
+
+
 def run_full_experiments():
     """
     运行 README 中对应的论文全量实验。
@@ -740,6 +985,9 @@ def run_full_experiments():
 
 if __name__ == '__main__':
 
-    # 执行论文全量实验。
-    run_full_experiments()
+    # 原论文全量实验暂时保留为对照入口，需要时可取消注释。
+    # run_full_experiments()
+
+    # 默认直接运行 MST 客户划分改进对比实验。
+    run_mst_improvement_experiments()
 
