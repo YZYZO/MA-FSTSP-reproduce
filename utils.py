@@ -18,6 +18,39 @@ from pathlib import Path
 from config import RESULTS_DIR
 
 
+def stable_node_key(node):
+    """
+    为图节点生成与输入容器枚举顺序无关的稳定排序键。
+
+    输入：
+    - node: 任意可哈希的 NetworkX 节点标识。
+
+    输出：
+    - 可比较元组，用于节点、边和并列候选的确定性排序。
+
+    实现逻辑：
+    1. 先把 NumPy 标量转换为对应的 Python 标量，避免 `int` 与 `np.int64`
+       因类型名称不同得到不一致顺序。
+    2. 对常见标量类型使用值本身排序。
+    3. 其他节点使用“类型全名 + repr”作为稳定回退，不依赖容器插入顺序。
+    """
+    # 统一 NumPy 标量与 Python 标量的表示，保证同一节点只有一个排序语义。
+    normalized = node.item() if isinstance(node, np.generic) else node
+    if isinstance(normalized, bool):
+        return ('bool', int(normalized))
+    if isinstance(normalized, int):
+        return ('integer', normalized)
+    if isinstance(normalized, float):
+        # `float.hex()` 为有限浮点数提供跨格式化设置的精确字符串表示。
+        return ('float', normalized.hex())
+    if isinstance(normalized, str):
+        return ('string', normalized)
+    return (
+        f'{type(normalized).__module__}.{type(normalized).__qualname__}',
+        repr(normalized),
+    )
+
+
 def result_path(*parts) -> Path:
     """
     构造项目结果目录下的路径，但不创建任何目录或文件。
@@ -223,6 +256,69 @@ def base_convert(number, i, j):
     return ans
 
 
+def _deterministic_minimum_spanning_tree(graph, weight='weight'):
+    """
+    使用稳定并列规则构造无向图的最小生成树。
+
+    输入：
+    - graph: 简单无向连通图。
+    - weight: 边权属性名称，默认使用 `weight`。
+
+    输出：
+    - 包含原节点、节点属性和入选边属性的 `networkx.Graph` 最小生成树。
+
+    实现逻辑：
+    1. 校验图类型、边权有限性和连通性前提。
+    2. 将每条无向边端点规范化，并按“权重、端点稳定键”排序。
+    3. 使用并查集执行 Kruskal；等权边的选择与节点和边插入顺序无关。
+    """
+    if graph.is_directed():
+        raise nx.NetworkXNotImplemented('确定性 MST 仅接受无向图。')
+    if graph.is_multigraph():
+        raise nx.NetworkXNotImplemented('确定性 MST 暂不接受多重图。')
+
+    # 先按稳定键加入节点，使后续树遍历也不依赖输入图的节点插入顺序。
+    tree = nx.Graph()
+    for node in sorted(graph.nodes, key=stable_node_key):
+        tree.add_node(node, **dict(graph.nodes[node]))
+
+    sortable_edges = []
+    for start, end, data in graph.edges(data=True):
+        edge_weight = float(data.get(weight, 1.0))
+        if not math.isfinite(edge_weight):
+            raise ValueError(f'MST 边 ({start!r}, {end!r}) 的权重不是有限数。')
+        if stable_node_key(end) < stable_node_key(start):
+            start, end = end, start
+        sortable_edges.append(
+            (
+                edge_weight,
+                stable_node_key(start),
+                stable_node_key(end),
+                start,
+                end,
+                dict(data),
+            )
+        )
+
+    # `UnionFind` 维护当前森林的连通分量；每次仅加入不会形成环的最小边。
+    components = nx.utils.UnionFind(tree.nodes)
+    for _, _, _, start, end, data in sorted(
+        sortable_edges,
+        key=lambda edge: edge[:3],
+    ):
+        if components[start] == components[end]:
+            continue
+        components.union(start, end)
+        tree.add_edge(start, end, **data)
+        if tree.number_of_edges() == max(0, tree.number_of_nodes() - 1):
+            break
+
+    expected_edge_count = max(0, tree.number_of_nodes() - 1)
+    if tree.number_of_edges() != expected_edge_count:
+        raise nx.NetworkXError('输入图不连通，无法构造最小生成树。')
+    return tree
+
+
 def mst_partition(graph, depots, cities):
     """
     基于最小生成树将客户分配给不同仓库。
@@ -240,8 +336,29 @@ def mst_partition(graph, depots, cities):
     2. 通过递归 DP 计算每个子树连接到仓库的最佳方式。
     3. 再通过第二次递归回溯每个客户应属于哪个仓库。
     """
-    # 在输入图上构造最小生成树。
-    tree = nx.minimum_spanning_tree(graph)
+    # 将仓库和客户规范化为稳定顺序，避免数组排列参与根节点和并列决策。
+    depot_list = list(depots)
+    city_list = list(cities)
+    if len(depot_list) == 0:
+        raise ValueError('MST 分仓至少需要一个仓库。')
+    if len(set(depot_list)) != len(depot_list):
+        raise ValueError('仓库数组中存在重复节点。')
+    if len(set(city_list)) != len(city_list):
+        raise ValueError('客户数组中存在重复节点。')
+    if set(depot_list) & set(city_list):
+        raise ValueError('仓库节点与客户节点不能重叠。')
+
+    # 内部保留原节点类型，只规范排列；字典提供稳定仓库编号，避免 NumPy 混合类型转换。
+    depots = sorted(depot_list, key=stable_node_key)
+    cities = sorted(city_list, key=stable_node_key)
+    depot_set = set(depots)
+    depot_index = {depot: index for index, depot in enumerate(depots)}
+    expected_nodes = set(depots) | set(cities)
+    if set(graph.nodes) != expected_nodes:
+        raise ValueError('MST 图节点必须与仓库、客户节点集合完全一致。')
+
+    # 使用确定性 Kruskal 构造 MST，等权边按规范节点键决定，不依赖边插入顺序。
+    tree = _deterministic_minimum_spanning_tree(graph)
 
     # 初始化每个节点的父节点标记，`-1` 表示尚未设置。
     for i in tree.nodes:
@@ -267,7 +384,7 @@ def mst_partition(graph, depots, cities):
         # `cons` 存储子树在“与仓库连通”情况下的代价。
         cons, ncons, index, diff = [], [], [], []
         # 遍历当前节点的所有邻居。
-        for n in tree.neighbors(node):
+        for n in sorted(tree.neighbors(node), key=stable_node_key):
             # 跳过父节点，只处理孩子。
             if n != tree.nodes[node]['parent']:
                 # 先假设孩子子树通过父边与仓库连通。
@@ -281,7 +398,7 @@ def mst_partition(graph, depots, cities):
                 # 记录孩子的非连通代价。
                 tree.nodes[n]['ncon'] = ncon
                 # 如果孩子本身就是仓库，则其连通方式比较特殊。
-                if n in depots:
+                if n in depot_set:
                     # 记录当前孩子走父边连接时的总代价。
                     cons.append(con + tree[node][n]['weight'])
                     # 记录孩子不走父边时的代价。
@@ -307,7 +424,7 @@ def mst_partition(graph, depots, cities):
                     # 如果孩子子树内没有仓库，只能把该子树整体向上带走。
                     ncons.append(ncon + tree[node][n]['weight'])
         # 如果当前节点就是仓库，则它天然连通到自己。
-        if node in depots:
+        if node in depot_set:
             # 当前子树连通代价为所有孩子非连通代价之和。
             con = sum(ncons)
             # 仓库节点不需要定义“非连通”方案。
@@ -354,16 +471,16 @@ def mst_partition(graph, depots, cities):
         2. 沿着最优通路继续递归，给所有节点写入 `group` 字段。
         """
         # 如果当前节点本身是仓库。
-        if node in depots:
+        if node in depot_set:
             # 将其分组编号设为它在 `depots` 中的位置。
-            tree.nodes[node]['group'] = np.where(depots == node)[0].item()
+            tree.nodes[node]['group'] = depot_index[node]
             # 遍历它的所有孩子。
-            for n in tree.neighbors(node):
+            for n in sorted(tree.neighbors(node), key=stable_node_key):
                 # 跳过父节点。
                 if n != tree.nodes[node]['parent']:
                     # 如果孩子也是仓库，则它自成一组。
-                    if n in depots:
-                        tree.nodes[n]['group'] = np.where(depots == n)[0].item()
+                    if n in depot_set:
+                        tree.nodes[n]['group'] = depot_index[n]
                         assign_group(n, tree.nodes[n]['con'])
                     # 如果孩子通过当前节点向上连接，则它继承当前仓库组。
                     elif tree.nodes[n]['pcon']:
@@ -378,8 +495,8 @@ def mst_partition(graph, depots, cities):
             # 找到最佳通路上的那个孩子。
             n = tree.nodes[node]['child']
             # 若该孩子本身就是仓库，则两者归入同组。
-            if n in depots:
-                index = np.where(depots == n)[0].item()
+            if n in depot_set:
+                index = depot_index[n]
                 tree.nodes[node]['group'] = index
                 tree.nodes[n]['group'] = index
                 assign_group(n, tree.nodes[n]['con'])
@@ -387,11 +504,11 @@ def mst_partition(graph, depots, cities):
                 # 若该孩子是客户，则继续递归直到找到仓库。
                 tree.nodes[node]['group'] = assign_group(n, tree.nodes[n]['con'])
             # 处理除最佳通道外的其他孩子。
-            for n in tree.neighbors(node):
+            for n in sorted(tree.neighbors(node), key=stable_node_key):
                 if n != tree.nodes[node]['parent'] and n != tree.nodes[node]['child']:
                     # 仓库孩子自成一组。
-                    if n in depots:
-                        tree.nodes[n]['group'] = np.where(depots == n)[0].item()
+                    if n in depot_set:
+                        tree.nodes[n]['group'] = depot_index[n]
                         assign_group(n, tree.nodes[n]['con'])
                     # 若孩子通过当前节点向上连接，则继承当前组。
                     elif tree.nodes[n]['pcon']:
@@ -403,12 +520,12 @@ def mst_partition(graph, depots, cities):
 
         else:
             # 当前节点连接到外部仓库时，继续把信息传给它的孩子。
-            for n in tree.neighbors(node):
+            for n in sorted(tree.neighbors(node), key=stable_node_key):
                 # 跳过父节点。
                 if n != tree.nodes[node]['parent']:
                     # 仓库孩子自成一组。
-                    if n in depots:
-                        tree.nodes[n]['group'] = np.where(depots == n)[0].item()
+                    if n in depot_set:
+                        tree.nodes[n]['group'] = depot_index[n]
                         assign_group(n, tree.nodes[n]['con'])
                     # 若孩子通过当前节点向上连接，则继承当前组。
                     elif tree.nodes[n]['pcon']:
@@ -428,7 +545,7 @@ def mst_partition(graph, depots, cities):
     # 遍历树中的所有节点。
     for node in tree.nodes:
         # 只把客户加入最终结果。
-        if node not in depots:
+        if node not in depot_set:
             groups[depots[tree.nodes[node]['group']]].append(node)
     # 返回仓库到客户列表的映射。
     return groups

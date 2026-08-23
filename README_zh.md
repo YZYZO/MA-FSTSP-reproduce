@@ -162,12 +162,17 @@ OSM 下载、刷新、半径、节点数和 Overpass 地址与地图加载实现
 - `results/manhattan/data/<时间戳>-manhattan_1k-<客户数>.npz`
 - `results/boston/data/<时间戳>-boston_11k-<客户数>.npz`
 
-新格式路网 NPZ 使用 `result_schema_version=2`，同时保存：
+新格式路网 NPZ 使用 `result_schema_version=3`，同时保存：
 
 - 全部实例的成本、耗时、仓库和客户节点；
 - 最终卡车/无人机联合路线；
 - Phase 1 客户分组、Phase 2 Set-TSP 顺序和 Phase 3 耗时/成本；
+- `phase1_partition_method`，用于区分原版无向覆盖语义与修正版双向平均语义；
 - best、median、worst 代表实例的路线约束与目标值一致性检查。
+
+修正版 Phase 1 方法标识为 `bidirectional-mean-set-mst-v1`。旧版 schema 2 文件仍可读取，
+但由于未保存该字段，会标记为 `legacy-or-unspecified`。比较 `master` 与修复分支时，应复用
+完全相同且顺序一致的仓库、客户数组，并按该字段分开汇总，不能把两类结果混入同一批次。
 
 变长结构使用 Unicode JSON 字符串数组，读取时不需要开启 pickle。结果不会保存全对距离矩阵、完整 DP 表或
 卡车逐道路节点展开结果。保存与恢复逻辑集中在 `experiment_results.py`。

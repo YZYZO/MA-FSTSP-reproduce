@@ -15,7 +15,7 @@ import math
 import networkx as nx
 import numpy as np
 from .baseline import Baseline
-from utils import mst_partition
+from utils import mst_partition, stable_node_key
 
 
 class MultiAgentFlyingSidekickTSP(Baseline):
@@ -40,6 +40,9 @@ class MultiAgentFlyingSidekickTSP(Baseline):
     2. 为每个仓库准备客户分组容器。
     3. 预计算每个客户的可服务区域。
     """
+    # Phase 1 方法标识会随实验结果保存，用于区分原版覆盖行为和修正版结果。
+    PHASE1_PARTITION_METHOD = 'bidirectional-mean-set-mst-v1'
+
     def __init__(self, graph, depots, cities, distance, drone, limit=1.5, speed=1.6, theta=(0.5, 0.5)):
         super().__init__(graph, depots, cities, distance, drone, limit, speed)
         self.groups = {depot: [] for depot in depots}
@@ -47,6 +50,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         self.cost = 0
         self.theta = theta
         self.const = math.sqrt(2)
+        self.phase1_partition_method = self.PHASE1_PARTITION_METHOD
 
         #语法：解包并合并两个字典，键相同时后面覆盖前面
         #作用：首先对客户节点（city），搜索整个图，保留无人机航程内的地图节点，组成键值对，构成客户集合
@@ -86,6 +90,119 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                     depot = _depot
             self.groups[depot].append(city)
 
+    def _directed_set_distance(self, source, target, service_sets):
+        """
+        计算论文公式 (2) 语义下从一个服务集合到另一个服务集合的有向距离。
+
+        输入：
+        - source: 起始客户或仓库节点。
+        - target: 目标客户或仓库节点。
+        - service_sets: 客户使用边界候选点、仓库使用自身单点的集合映射。
+
+        输出：
+        - 从 `source` 服务完成后转移到 `target` 的最小标准化成本。
+
+        实现逻辑：
+        1. 以卡车直接从起点到终点的距离作为保底方案。
+        2. 枚举两个服务集合中的候选点，叠加起点无人机段、卡车段和终点无人机段。
+        3. 保留最小有限成本；方向反转时会独立重新计算，不复用当前结果。
+        """
+        try:
+            best_distance = float(self.distance['truck'][source][target])
+            source_nodes = service_sets[source]
+            target_nodes = service_sets[target]
+        except KeyError as exc:
+            raise ValueError(
+                f'缺少 Set-MST 距离或候选集合数据：{source!r} -> {target!r}。'
+            ) from exc
+
+        for source_node in source_nodes:
+            for target_node in target_nodes:
+                try:
+                    candidate = (
+                        float(self.distance['drone'][source][source_node])
+                        / self.speed
+                        * self.const
+                        + float(
+                            self.distance['truck'][source_node][target_node]
+                        )
+                        + float(self.distance['drone'][target_node][target])
+                        / self.speed
+                        * self.const
+                    )
+                except KeyError as exc:
+                    raise ValueError(
+                        '缺少 Set-MST 候选点间距离：'
+                        f'{source!r}/{source_node!r} -> '
+                        f'{target_node!r}/{target!r}。'
+                    ) from exc
+                if math.isfinite(candidate):
+                    best_distance = min(best_distance, candidate)
+
+        if not math.isfinite(best_distance):
+            raise ValueError(
+                f'Set-MST 有向距离 {source!r} -> {target!r} 不是有限数。'
+            )
+        return best_distance
+
+    def _validate_set_mst_input(self, convex_sets):
+        """
+        校验 Set-MST 的仓库、客户和候选集合输入。
+
+        输入：
+        - convex_sets: 客户到边界候选点列表的映射。
+
+        输出：
+        - `(ordered_entities, service_sets)`，分别是稳定节点序列和统一服务集合。
+
+        实现逻辑：拒绝重复节点、仓库客户重叠、图外节点和缺失客户集合，并把仓库
+        规范成单点集合，使三类边能够使用同一套距离公式。
+        """
+        depots = list(self.depots)
+        cities = list(self.cities)
+        if len(depots) == 0:
+            raise ValueError('Set-MST 至少需要一个仓库。')
+        if len(set(depots)) != len(depots):
+            raise ValueError('仓库数组中存在重复节点。')
+        if len(set(cities)) != len(cities):
+            raise ValueError('客户数组中存在重复节点。')
+        if set(depots) & set(cities):
+            raise ValueError('仓库节点与客户节点不能重叠。')
+
+        graph_nodes = set(self.graph.nodes)
+        problem_nodes = set(depots) | set(cities)
+        missing_graph_nodes = problem_nodes - graph_nodes
+        if missing_graph_nodes:
+            raise ValueError(
+                '仓库或客户不在路网中：'
+                f'{sorted(missing_graph_nodes, key=stable_node_key)!r}。'
+            )
+
+        missing_sets = set(cities) - set(convex_sets)
+        if missing_sets:
+            raise ValueError(
+                '缺少客户候选集合：'
+                f'{sorted(missing_sets, key=stable_node_key)!r}。'
+            )
+
+        # `service_sets` 统一表示论文中的集合 S；空边界仍允许使用卡车直达保底成本。
+        service_sets = {depot: [depot] for depot in depots}
+        for city in cities:
+            candidate_nodes = list(convex_sets[city])
+            invalid_nodes = set(candidate_nodes) - graph_nodes
+            if invalid_nodes:
+                raise ValueError(
+                    f'客户 {city!r} 的候选集合包含图外节点：'
+                    f'{sorted(invalid_nodes, key=stable_node_key)!r}。'
+                )
+            service_sets[city] = sorted(
+                set(candidate_nodes),
+                key=stable_node_key,
+            )
+
+        ordered_entities = sorted(problem_nodes, key=stable_node_key)
+        return ordered_entities, service_sets
+
     def set_mst(self, convex_sets):
         """
         基于候选区域构造完全图，并用 MST 分区给客户分组。
@@ -101,31 +218,39 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         2. 边权采用论文中的近似代价公式。
         3. 调用 `mst_partition` 完成仓库-客户划分。
         """
-        # construct the fully connected graph between convex sets and depots
+        ordered_entities, service_sets = self._validate_set_mst_input(
+            convex_sets
+        )
+
+        # 构造语义明确的无向完全图；每个无序节点对只添加一次，不存在覆盖写入。
         graph = nx.Graph()
-        for depot in self.depots:
-            graph.add_node(depot)
-        for city in self.cities:
-            graph.add_node(city)
-        # distance computed as Eq. (3) in the paper
-        for depot in self.depots:
-            for city in self.cities:
-                weight = self.distance['truck'][depot][city]
-                for node in convex_sets[city]:
-                    weight = min(weight, self.distance['truck'][depot][node] +
-                                 self.distance['drone'][node][city] / self.speed * self.const)
-                graph.add_edge(depot, city, weight=weight)
-            for _depot in self.depots:
-                graph.add_edge(depot, _depot, weight=self.distance['truck'][depot][_depot])
-        for city in self.cities:
-            for _city in self.cities:
-                weight = self.distance['truck'][city][_city]
-                for node in convex_sets[city]:
-                    for _node in convex_sets[_city]:
-                        weight = min(weight, self.distance['truck'][node][_node] +
-                                     self.distance['drone'][city][node] / self.speed * self.const
-                                     + self.distance['drone'][_city][_node] / self.speed * self.const)
-                graph.add_edge(city, _city, weight=weight)
+        graph.graph['phase1_partition_method'] = self.phase1_partition_method
+        graph.add_nodes_from(ordered_entities)
+        for source_index, source in enumerate(ordered_entities):
+            for target in ordered_entities[source_index + 1:]:
+                forward_weight = self._directed_set_distance(
+                    source,
+                    target,
+                    service_sets,
+                )
+                reverse_weight = self._directed_set_distance(
+                    target,
+                    source,
+                    service_sets,
+                )
+                # 双向平均保留两个方向的道路代价，同时为无向 MST 定义唯一权重。
+                symmetric_weight = (forward_weight + reverse_weight) / 2.0
+                if not math.isfinite(symmetric_weight):
+                    raise ValueError(
+                        f'Set-MST 无向边 ({source!r}, {target!r}) 权重不是有限数。'
+                    )
+                graph.add_edge(
+                    source,
+                    target,
+                    weight=symmetric_weight,
+                    forward_weight=forward_weight,
+                    reverse_weight=reverse_weight,
+                )
         self.groups = mst_partition(graph, self.depots, self.cities)
 
     @staticmethod
@@ -424,16 +549,21 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         实现逻辑：
         - 对图中每个节点，找到满足阈值条件且最近的客户，并将节点归到该客户名下。
         """
-        #构造空字典，键为客户，值为空，存储候选点
-        convex_sets = {city: [] for city in self.cities}
-        #遍历所有点，对每个点找到最近的客户，并将点归到该客户名下
+        # 客户采用稳定节点顺序，等距候选不再由输入数组中“最后出现者”决定。
+        ordered_cities = sorted(set(self.cities), key=stable_node_key)
+        convex_sets = {city: [] for city in ordered_cities}
+        # 遍历所有点，对每个点按“距离、稳定客户键”选择唯一最近客户。
         for node in self.graph.nodes:
             closest_city = None
-            closest_distance = self.limit * theta
-            for city in self.cities:
-                if self.distance['drone'][node][city] <= closest_distance:
+            closest_key = None
+            for city in ordered_cities:
+                city_distance = self.distance['drone'][node][city]
+                if city_distance > self.limit * theta:
+                    continue
+                candidate_key = (city_distance, stable_node_key(city))
+                if closest_key is None or candidate_key < closest_key:
                     closest_city = city
-                    closest_distance = self.distance['drone'][node][city]
+                    closest_key = candidate_key
             if closest_city is not None:
                 convex_sets[closest_city].append(node)
         return convex_sets
@@ -455,9 +585,9 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         convex_sets = self.get_convex_sets(theta)
         #初始化边界点集合
         #语法：字典推导式，遍历所有客户，创建键值对，键为客户（city），值为空
-        boundary_convex_sets = {city: [] for city in self.cities}
+        boundary_convex_sets = {city: [] for city in convex_sets}
         #遍历每个客户的，服务范围内的点的，邻居节点
-        for city in self.cities:
+        for city in convex_sets:
             for node in convex_sets[city]:
                 for neighbor in nx.neighbors(self.graph, node):
                     #若该点的邻居点不在服务范围（集合）内，则说明该点是边界点

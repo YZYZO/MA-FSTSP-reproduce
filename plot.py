@@ -983,6 +983,11 @@ def _large_road_route_stats(graph, solution, depot_records, limit, speed):
 def _solve_large_road_with_telemetry(model):
     total_start = time.perf_counter()
     telemetry = {
+        'phase1_partition_method': getattr(
+            model,
+            'phase1_partition_method',
+            'legacy-or-unspecified',
+        ),
         'timings': {},
         'depot_records': [],
     }
@@ -1080,6 +1085,10 @@ def _build_large_road_summary(
             'limit': config.get('limit', LARGE_ROAD_LIMIT),
             'speed': config.get('speed', LARGE_ROAD_SPEED),
             'theta': config.get('theta', LARGE_ROAD_THETA),
+            'phase1_partition_method': telemetry.get(
+                'phase1_partition_method',
+                'legacy-or-unspecified',
+            ),
             'depots': list(depots),
             'customers': list(cities),
         },
@@ -1358,6 +1367,10 @@ def _telemetry_from_saved_result(saved_result):
             },
         })
     return {
+        'phase1_partition_method': saved_result.get(
+            'phase1_partition_method',
+            'legacy-or-unspecified',
+        ),
         'timings': {
             'boundary_convex_sets_seconds': saved_result.get('phase1_boundary_time'),
             'mst_partition_seconds': saved_result.get('phase1_partition_time'),

@@ -167,6 +167,11 @@ def _solve_model_with_process_data(model):
         depot_records.append(record)
 
     process_data = {
+        'phase1_partition_method': getattr(
+            model,
+            'phase1_partition_method',
+            'legacy-or-unspecified',
+        ),
         'boundary_set_sizes': boundary_set_sizes,
         'groups': group_records,
         'depot_records': depot_records,
@@ -373,6 +378,10 @@ def _build_representative_trace(
         'depots': list(depots),
         'customers': expected_customers,
         'phase1': {
+            'partition_method': process_data.get(
+                'phase1_partition_method',
+                'legacy-or-unspecified',
+            ),
             'boundary_set_sizes': process_data['boundary_set_sizes'],
             'boundary_convex_sets_seconds': process_data['boundary_convex_sets_seconds'],
             'mst_partition_seconds': process_data['mst_partition_seconds'],
@@ -428,6 +437,21 @@ def _build_stsp_result_arrays(
     phase1_groups = []
     phase2_orders = []
 
+    # 同一批结果必须来自同一种 Phase 1 语义，避免把 legacy 与修正版混入一个文件。
+    phase1_partition_methods = {
+        process_data.get(
+            'phase1_partition_method',
+            'legacy-or-unspecified',
+        )
+        for process_data in processes
+    }
+    if len(phase1_partition_methods) != 1:
+        raise ValueError(
+            '同一批结果包含多种 Phase 1 分区方法：'
+            f'{sorted(phase1_partition_methods)!r}。'
+        )
+    phase1_partition_method = phase1_partition_methods.pop()
+
     for instance_index, process_data in enumerate(processes):
         records = process_data['depot_records']
         if len(records) != depot_count:
@@ -470,7 +494,11 @@ def _build_stsp_result_arrays(
     ]
 
     result_arrays = {
-        'result_schema_version': np.asarray(2, dtype=np.int64),
+        'result_schema_version': np.asarray(3, dtype=np.int64),
+        'phase1_partition_method': np.asarray(
+            phase1_partition_method,
+            dtype=np.str_,
+        ),
         'instance_indices': np.arange(len(results), dtype=np.int64),
         'depots': np.asarray(depots),
         'cities': np.asarray(cities),
@@ -622,6 +650,11 @@ def _load_large_road_saved_result(result_file, instance_index=None):
         saved = {
             'instance_index': int(instance_index),
             'cost': float(costs[instance_index]),
+            'phase1_partition_method': (
+                str(np.asarray(data['phase1_partition_method']).item())
+                if 'phase1_partition_method' in data.files
+                else 'legacy-or-unspecified'
+            ),
         }
         if 'stsp_time' in data.files:
             times = np.asarray(data['stsp_time']).reshape(-1)
