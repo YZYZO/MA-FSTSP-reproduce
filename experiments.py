@@ -11,6 +11,10 @@ import gc
 from datetime import datetime
 
 from src.fstsp import MultiAgentFlyingSidekickTSP
+from src.pruning import (
+    P7ComparisonOptions,
+    run_p7_endpoint_dominance_comparison,
+)
 
 from problem import (
     multiagent_instance_on_manhattan,
@@ -341,7 +345,44 @@ def run_full_experiments(
             print(f'Released shared road-network distance data for {spec.dataset_label}.')
 
 
+def run_p7_pruning_experiments():
+    """
+    运行 P7 外部端点对支配的 A/B/C 配对试验档。
+
+    输入：无；默认使用 1K 路网、5 个配对实例以及 20/50 两档客户规模。
+    输出：本次 P7 比较结果目录。
+    实现逻辑：A 运行原始密集模型，B 运行稀疏未剪模型，C 在同一稀疏模型上启用 P7。
+    """
+
+    # 正式全规模实验可把这里的配置改为 50 次和 (50, 100, 150)，并扩展 road_specs。
+    # options = P7ComparisonOptions(
+    #     instance_count=5,
+    #     customer_sizes=(20, 50),
+    #     max_preprocessing_seconds=30.0,
+    #     record_evidence=False,
+    # )
+    # return run_p7_endpoint_dominance_comparison(
+    #     road_specs=(MANHATTAN_1K_EXPERIMENT,),
+    #     options=options,
+    # )
+
+    options = P7ComparisonOptions(
+        instance_count=60,
+        customer_sizes=(50,100,150),
+        max_preprocessing_seconds=None,
+        record_evidence=False,
+    )
+    return run_p7_endpoint_dominance_comparison(
+        road_specs=(MANHATTAN_1K_EXPERIMENT,    MANHATTAN_11K_EXPERIMENT,   MANHATTAN_55K_EXPERIMENT),
+        options=options,
+    )
+
+
+
 if __name__ == '__main__':
 
-    # 执行论文全量实验。
-    run_full_experiments()
+    #     # 执行论文全量实验。
+    # run_full_experiments()
+
+    # 默认执行 P7 试验档
+    run_p7_pruning_experiments()
