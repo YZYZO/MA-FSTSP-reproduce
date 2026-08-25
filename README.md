@@ -23,7 +23,13 @@ To run all the experiments in the paper, you can use
 ```bash
 python experiments.py
 ```
-The active experiment sizes are selected in `run_full_experiments()` in `experiments.py`. The 1K Manhattan reproduction uses `datasets/nyc_1024.graphml`; the Boston-scale 11K reproduction keeps the `boston_11k` result name while using `datasets/nyc_11000.graphml` as its road network.
+`run_full_experiments()` runs the 1K, 11K, and 55K NYC road networks in that order. Each map initializes its pairwise road/drone distances once, then reuses them for 50, 100, and 150 customers before releasing the distance matrices. The 1K scale uses 5 depots and 3 drones per truck; the 11K and 55K scales use 10 depots and 4 drones per truck. The 11K reproduction keeps the historical `boston_11k` result name, while the 55K experiment uses `datasets/nyc.graphml` and the `manhattan_55k` result name.
+
+The default command runs 100 instances for every map/customer-size combination and is intended for the large-memory server. Run the lightweight orchestration tests locally without loading the real maps:
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -m unittest tests.test_map_scale_batch_initialization -v
+```
 
 Boston/Cambridge OSM download settings are colocated with the map-loading implementation in `problem.py`. Download and refresh are disabled by default, and both switches must be enabled before the code accesses Overpass.
 To generate all the figures in the paper, you can use 

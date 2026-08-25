@@ -82,8 +82,17 @@ pip install -r requirements.txt
 python experiments.py
 ```
 
-1K 实验入口为 `test_manhattan_1k(num, size)`，使用 5 个仓库、每车 3 架无人机；11K 实验入口为
-`test_manhattan_11k(num, size)`，使用 10 个仓库、每车 4 架无人机。11K 的完整批次建议在服务器运行。
+1K、11K、55K 实验入口分别为 `test_manhattan_1k(num, size)`、`test_manhattan_11k(num, size)` 和
+`test_manhattan_55k(num, size)`。其中 1K 地图使用 5 个仓库、每车 3 架无人机，11K 和 55K 地图使用
+10 个仓库、每车 4 架无人机。
+
+`run_full_experiments()` 默认按 1K、11K、55K 顺序运行。每张地图只初始化一次卡车/无人机距离，随后依次运行
+50、100、150 客户，释放当前距离矩阵后再切换地图。默认每个组合运行 100 个实例，面向大内存服务器。
+本地正确性验证不会加载真实大图，可运行：
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -m unittest tests.test_map_scale_batch_initialization -v
+```
 
 ## 如何生成图表
 运行：
@@ -136,6 +145,7 @@ python plot.py
 - `RESULTS_DIR`：实验与绘图输出目录，默认是 `results/`。
 - `MANHATTAN1k_GRAPH_PATH`：1K GraphML 路径。
 - `MANHATTAN11k_GRAPH_PATH`：11K GraphML 路径。
+- `MANHATTAN55k_GRAPH_PATH`：完整约 55K NYC GraphML 路径。
 
 OSM 下载、刷新、半径、节点数和 Overpass 地址与地图加载实现放在 `problem.py`。下载与刷新默认都关闭，
 只有同时启用 `ALLOW_OSM_DOWNLOAD` 和 `REFRESH_OSM` 才会联网刷新 Boston/Cambridge 路网。

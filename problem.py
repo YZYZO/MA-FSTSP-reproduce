@@ -8,29 +8,19 @@
 4. 生成论文实验所需的小规模、多仓库随机实例。
 """
 
-# 导入 `json`，用于保存 Manhattan 的距离缓存。
 import json
-# 导入高精度单调时钟，用于统计距离初始化的墙钟耗时。
 import time
-# 导入 `networkx`，用于图构建与最短路计算。
 import networkx as nx
-# 导入 `numpy`，用于随机采样和数组处理。
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 
 
-# 导入 `osmnx`，用于从 OpenStreetMap 下载真实路网。   
 import osmnx as ox
-# 导入 `pickle`，用于缓存 Cambridge 的距离矩阵。
 import pickle
-# 导入 `lru_cache`，避免重复读取大型 GraphML 文件。
 from functools import lru_cache
-# 导入 `Path`，用于校验调用方显式传入的 GraphML 文件路径。
 from pathlib import Path
-# 导入球面距离函数，用于根据经纬度构造边权。
 from utils import haversine
-# 导入进度条，展示全点对距离初始化的源节点处理进度。
 from tqdm import tqdm
 from config import (
     DATASETS_DIR,
@@ -41,25 +31,17 @@ from config import (
 # 只有同时开启下载授权和刷新开关，`cambridge()` 才会访问 Overpass 网络服务。
 ALLOW_OSM_DOWNLOAD = False
 REFRESH_OSM = False
-# 下载中心点采用 Boston 市中心的纬度、经度顺序，供 OSMnx 使用。
 OSM_CENTER_POINT = (42.3601, -71.0589)
-# 下载半径单位为米，只影响显式联网刷新的路网覆盖范围。
 OSM_DIST_METERS = 1600
-# 本地或下载图超过此节点数时，保留中心点附近的连通路网以控制实验规模。
 OSM_MAX_NODES = 11000
-# 单次 Overpass 请求超时秒数，避免网络异常时无限等待。
 OSM_TIMEOUT = 300
-# Overpass 服务端按顺序尝试，前一端点失败后才切换到下一端点。
 OVERPASS_ENDPOINTS = (
     'https://overpass.kumi.systems/api',
     'https://overpass-api.de/api',
 )
 
-# 定义 Manhattan 缓存文件路径。
 MANHATTAN_CACHE = DATASETS_DIR / 'manhattan.json'
-# 定义 Cambridge 缓存文件路径。
 CAMBRIDGE_CACHE = DATASETS_DIR / 'cambridge_all_pair_road_distance.pkl'
-# 定义 Manhattan 图文件可能出现的位置。优先使用论文示意图对应的曼哈顿子图。
 MANHATTAN_GRAPH_CANDIDATES = (
     PROJECT_ROOT / 'manhatten.graphml',
     DATASETS_DIR / 'manhatten.graphml',
@@ -68,7 +50,6 @@ MANHATTAN_GRAPH_CANDIDATES = (
     PROJECT_ROOT / 'nyc.graphml',
     DATASETS_DIR / 'nyc.graphml',
 )
-# 定义 Cambridge/Boston 图文件可能出现的位置。
 CAMBRIDGE_GRAPH_CANDIDATES = (
     PROJECT_ROOT / 'boston.graphml',
     DATASETS_DIR / 'boston.graphml',
@@ -252,27 +233,16 @@ def _normalize_graph(graph, x_key, y_key, nodes=None):
     3. 拷贝节点坐标并写入统一的 `pos=[lon, lat]` 结构。
     4. 用球面距离作为边权重新建立边。
     """
-    # 新建一个标准化后的多重有向图。
     road_graph = nx.MultiDiGraph()
-    # 如果没有指定节点子集，就保留全部节点。
     selected_nodes = list(graph.nodes if nodes is None else nodes)
-    # 为每个旧节点分配一个新的连续整数编号。
     index = {node: i for i, node in enumerate(selected_nodes)}
-    # 遍历保留节点，拷贝坐标。
     for node in selected_nodes:
-        # 将坐标保存到统一的 `pos` 字段中。
         road_graph.add_node(index[node], pos=[float(graph.nodes[node][x_key]), float(graph.nodes[node][y_key])])
-    # 遍历原图中的边。
     for start, end, _ in graph.edges(data=True):
-        # 只保留两个端点都在选定集合中的边。
         if start in index and end in index:
-            # 读取起点坐标。
             start_pos = road_graph.nodes[index[start]]['pos']
-            # 读取终点坐标。
             end_pos = road_graph.nodes[index[end]]['pos']
-            # 用球面距离作为边权建立标准化边。
             road_graph.add_edge(index[start], index[end], weight=haversine(start_pos, end_pos))
-    # 返回标准化后的图。
     return road_graph
 
 
@@ -294,47 +264,26 @@ def _synthetic_grid_graph(rows, cols, origin, step):
     2. 在上下左右相邻节点之间建立双向道路边。
     3. 用球面距离作为边权。
     """
-    # 新建一个多重有向图。
     graph = nx.MultiDiGraph()
-    # 逐行生成网格节点。
     for row in range(rows):
-        # 遍历当前行中的每一列。
         for col in range(cols):
-            # 将二维网格坐标编码为一维节点编号。
             node = row * cols + col
-            # 计算该节点的经度。
             lon = origin[0] + col * step
-            # 计算该节点的纬度。
             lat = origin[1] + row * step
-            # 将节点加入图中，并保存位置。
             graph.add_node(node, pos=[lon, lat])
-    # 再次遍历网格，用于添加边。
     for row in range(rows):
-        # 遍历当前行的每一列。
         for col in range(cols):
-            # 计算当前节点编号。
             node = row * cols + col
-            # 如果右侧还有节点，则连一条横向双向边。
             if col + 1 < cols:
-                # 右邻节点编号。
                 neighbor = node + 1
-                # 计算当前节点与右邻节点之间的距离。
                 weight = haversine(graph.nodes[node]['pos'], graph.nodes[neighbor]['pos'])
-                # 添加从当前节点到右邻节点的边。
                 graph.add_edge(node, neighbor, weight=weight)
-                # 添加从右邻节点回当前节点的边。
                 graph.add_edge(neighbor, node, weight=weight)
-            # 如果下方还有节点，则连一条纵向双向边。
             if row + 1 < rows:
-                # 下邻节点编号。
                 neighbor = node + cols
-                # 计算当前节点与下邻节点之间的距离。
                 weight = haversine(graph.nodes[node]['pos'], graph.nodes[neighbor]['pos'])
-                # 添加从当前节点到下邻节点的边。
                 graph.add_edge(node, neighbor, weight=weight)
-                # 添加从下邻节点回当前节点的边。
                 graph.add_edge(neighbor, node, weight=weight)
-    # 返回生成好的网格图。
     return graph
 
 
@@ -446,39 +395,73 @@ def manhattan(graph_path=None):
                 f'Manhattan/NYC GraphML 文件不存在：{selected_graph_path.resolve()}'
             )
     # 如果没找到真实图，就使用合成网格图。
-    if selected_graph_path is None:
-        # 打印提示信息。
-        print('Manhattan GraphML not found, using a synthetic Manhattan-style grid instance instead.')
-        # 生成一个合成 Manhattan 风格网格图。
-        manhattan_graph = _synthetic_grid_graph(20, 20, origin=(-73.99, 40.75), step=0.002)
-    else:
-        # 读取真实 GraphML 文件。
-        g = nx.MultiDiGraph(nx.read_graphml(selected_graph_path))
-        # 将真实图标准化为统一编号与坐标结构。
-        x_key, y_key = _coordinate_keys(g)
-        nodes = _largest_strong_component(g)
-        manhattan_graph = _normalize_graph(g, x_key, y_key, nodes=nodes)
+
+    g = nx.MultiDiGraph(nx.read_graphml(selected_graph_path))
+     # 将真实图标准化为统一编号与坐标结构。
+    x_key, y_key = _coordinate_keys(g)
+    nodes = _largest_strong_component(g)
+    manhattan_graph = _normalize_graph(g, x_key, y_key, nodes=nodes)
     # 确保缓存目录存在。
     _ensure_datasets_dir()
-    # 如果 Manhattan 距离缓存不存在，就创建它。
-    if (
-        graph_path is None
-        and not MANHATTAN_CACHE.is_file()
-        and manhattan_graph.number_of_nodes() <= 5000
-    ):
-        # 打印缓存构造提示。
-        print('=============preparing pairwise data=================')
-        # 计算所有节点对之间的最短路距离。
-        lengths = dict(nx.all_pairs_dijkstra_path_length(manhattan_graph, weight='weight'))
-        # 将距离字典改写成二维列表，便于 JSON 保存。
-        pairwise_distances = [[lengths[i][j] for j in manhattan_graph.nodes] for i in manhattan_graph.nodes]
-        # 以写入方式打开缓存文件。
-        with MANHATTAN_CACHE.open('w') as f:
-            # 将距离矩阵写入 JSON。
-            json.dump(pairwise_distances, f)
-    # 返回路网图。
+
     return manhattan_graph
 
+# @lru_cache(maxsize=4)
+# def manhattan(graph_path=None):
+#     """
+#     读取指定的 Manhattan/NYC 路网，并标准化节点编号、坐标和边权。
+
+#     输入：
+#     - graph_path: 可选 GraphML 路径；省略时沿用现有 Manhattan 候选路径逻辑。
+
+#     输出：
+#     - manhattan_graph: `networkx.MultiDiGraph` 路网图。
+
+#     实现逻辑：
+#     1. 调用方传入路径时严格读取该文件，路径不存在则直接报错。
+#     2. 未传入路径时，继续从历史候选位置查找默认 Manhattan 地图。
+#     3. 默认地图缺失时构造规则网格，保持原有离线回退行为。
+#     4. 仅对默认地图保留原有 Manhattan 距离缓存生成逻辑。
+#     """
+#     # 显式路径用于 1k/11k 实验；默认调用继续采用原有候选路径优先级。
+#     if graph_path is None:
+#         selected_graph_path = next(
+#             (path for path in MANHATTAN_GRAPH_CANDIDATES if path.is_file()),
+#             None,
+#         )
+#     else:
+#         selected_graph_path = Path(graph_path)
+#         if not selected_graph_path.is_file():
+#             raise FileNotFoundError(
+#                 f'Manhattan/NYC GraphML 文件不存在：{selected_graph_path.resolve()}'
+#             )
+#     # 如果没找到真实图，就使用合成网格图。
+#     if selected_graph_path is None:
+#         # 打印提示信息。
+#         print('Manhattan GraphML not found, using a synthetic Manhattan-style grid instance instead.')
+#         # 生成一个合成 Manhattan 风格网格图。
+#         manhattan_graph = _synthetic_grid_graph(20, 20, origin=(-73.99, 40.75), step=0.002)
+#     else:
+#         # 读取真实 GraphML 文件。
+#         g = nx.MultiDiGraph(nx.read_graphml(selected_graph_path))
+#         # 将真实图标准化为统一编号与坐标结构。
+#         x_key, y_key = _coordinate_keys(g)
+#         nodes = _largest_strong_component(g)
+#         manhattan_graph = _normalize_graph(g, x_key, y_key, nodes=nodes)
+#     # 确保缓存目录存在。
+#     _ensure_datasets_dir()
+#     # 如果 Manhattan 距离缓存不存在，就创建它。
+#     if (
+#         graph_path is None
+#         and not MANHATTAN_CACHE.is_file()
+#         and manhattan_graph.number_of_nodes() <= 5000
+#     ):
+#         print('=============preparing pairwise data=================')
+#         lengths = dict(nx.all_pairs_dijkstra_path_length(manhattan_graph, weight='weight'))
+#         pairwise_distances = [[lengths[i][j] for j in manhattan_graph.nodes] for i in manhattan_graph.nodes]
+#         with MANHATTAN_CACHE.open('w') as f:
+#             json.dump(pairwise_distances, f)
+#     return manhattan_graph
 
 def cambridge():
     """
@@ -513,21 +496,15 @@ def cambridge():
     # 如果环境变量允许联网下载，则尝试使用 OSM 数据。
     if ALLOW_OSM_DOWNLOAD:
         try:
-            # 从 OSM 下载小范围可驾驶路网，避免整座 Boston 过大导致 Overpass 失败。
             graph = _download_boston_graph()
             graph = _limit_nodes_near_center(graph, max_nodes, center_point)
-            # 取最大强连通分量，确保最短路普遍可达。
             nodes = _largest_strong_component(graph)
-            # 返回标准化后的真实图。
             return _normalize_graph(graph, 'x', 'y', nodes=nodes)
         except Exception as exc:
-            # 下载失败时给出提示。
             print(f'Unable to download the Boston road network: {type(exc).__name__}: {exc}')
             print('Using a synthetic Cambridge-style grid instead.')
     else:
-        # 若未开启联网下载，则直接提示走离线路径。
         print('boston.graphml/cambridge.graphml not found, using a synthetic Cambridge-style grid instance instead.')
-    # 返回合成 Cambridge 网格图。
     return _synthetic_grid_graph(14, 14, origin=(-71.11, 42.37), step=0.003)
 
 
@@ -548,16 +525,11 @@ def random_multiagent_instance(graph, num_depots, num_destinations):
     2. 检查图节点数是否足够。
     3. 从图中随机采样仓库和客户节点。
     """
-    # 固定随机种子，保证结果可复现。
     np.random.seed(0)
-    # 检查节点总数是否足够完成采样。
     assert len(graph.nodes) > num_depots + num_destinations, \
         f"impossible to sample {num_depots + num_destinations} locations from {len(graph.nodes)} nodes"
-    # 检查仓库数必须大于 1，因为该函数面向多仓库问题。
     assert num_depots > 1, f"fewer than 2 depots, try to use random_instance function to generate for single agent"
-    # 一次性从图中采样仓库与客户节点。
     locations = np.random.choice(graph.nodes, size=num_depots + num_destinations)
-    # 返回图对象、仓库集合和客户集合。
     return graph, locations[:num_depots], locations[num_depots:]
 
 
@@ -580,61 +552,101 @@ def small_instance(num, nodes, depots, cities):
     3. 在子图上构造卡车/无人机距离矩阵。
     4. 重复随机采样得到多个实例。
     """
-    # 固定随机种子，保证可复现。
     np.random.seed(0)
-    # 读取完整 Manhattan 路网。
     graph = manhattan()
-    # 随机选择一个节点作为 BFS 起点。
     node = np.random.choice(graph.nodes, 1).item()
-    # 用队列保存待扩张节点。
     _nodes = [node]
-    # 新建一个有向子图。
     subgraph = nx.DiGraph()
-    # 将起点加入子图并拷贝坐标。
     subgraph.add_node(node, pos=graph.nodes[node]['pos'])
-    # 当子图规模未达到目标节点数时继续扩张。
     while subgraph.number_of_nodes() < nodes:
-        # 取出队首节点并获得其邻居。
         neighbors = graph.neighbors(_nodes.pop(0))
-        # 遍历这些邻居。
         for n in neighbors:
-            # 如果当前邻居尚未加入子图，则将其加入。
             if not subgraph.has_node(n):
-                # 将邻居加入 BFS 队列。
                 _nodes.append(n)
-                # 将邻居加入子图并拷贝坐标。
                 subgraph.add_node(n, pos=graph.nodes[n]['pos'])
-            # 如果规模已足够，则结束当前扩张层。
             if subgraph.number_of_nodes() >= nodes:
                 break
-    # 断言子图节点数正确。
     assert subgraph.number_of_nodes() == nodes, 'wrong number of nodes, check the code'
-    # 为子图补齐原图中对应的边。
     for start in subgraph.nodes:
-        # 遍历子图中的所有终点。
         for end in subgraph.nodes:
-            # 若原图中存在 `start -> end` 边，则将其加入子图。
             if graph.has_edge(start, end):
-                # 添加正向边。
                 subgraph.add_edge(start, end, weight=graph.edges[start, end, 0]['weight'])
-                # 同时补一条反向边，增强可达性。
                 subgraph.add_edge(end, start, weight=graph.edges[start, end, 0]['weight'])
-    # 在子图上构造卡车和无人机距离矩阵。
     distance = {'truck': dict(nx.all_pairs_dijkstra_path_length(subgraph, weight='weight')),
                 'drone': {i: {j: haversine(subgraph.nodes[i]['pos'], subgraph.nodes[j]['pos'])
                               for j in subgraph.nodes} for i in subgraph.nodes}}
-    # 用于保存多个实例的仓库采样。
     _depots, _cities = [], []
-    # 重复采样 `num` 次。
     for _ in range(num):
-        # 在子图节点中无放回采样仓库和客户。
         locations = np.random.choice(subgraph.nodes, depots + cities, replace=False)
-        # 保存当前实例的仓库集合。
         _depots.append(locations[:depots])
-        # 保存当前实例的客户集合。
         _cities.append(locations[depots:])
-    # 返回子图、实例采样与距离矩阵。
     return subgraph, _depots, _cities, distance
+
+
+def prepare_manhattan_road_network(
+    graph_path=None,
+    show_distance_progress=True,
+):
+    """
+    读取指定 Manhattan/NYC 路网，并一次性构造可供多个客户规模复用的距离数据。
+
+    输入：
+    - graph_path: 可选 GraphML 路径；省略时使用默认 Manhattan 路网。
+    - show_distance_progress: 是否显示全点对距离初始化进度条。
+
+    输出：
+    - `(graph, distance, distance_stats)`：标准化路网、卡车/无人机距离和初始化耗时。
+
+    实现逻辑：
+    1. 只读取并标准化一次目标路网。
+    2. 只构造一次卡车与无人机全点对距离。
+    3. 将准备结果交给不同客户规模的实验共享，避免重复初始化大型矩阵。
+    """
+    # 地图对象与距离矩阵共同组成一张地图的可复用准备结果。
+    graph = manhattan(graph_path)
+    distance, distance_stats = _pairwise_distance(
+        graph,
+        return_stats=True,
+        show_progress=show_distance_progress,
+    )
+    return graph, distance, distance_stats
+
+
+def sample_multiagent_instances(graph, num, depots, cities, seed=0):
+    """
+    在已准备好的路网上采样多仓库、多客户实例，不重复构造距离矩阵。
+
+    输入：
+    - graph: 已读取并标准化的路网。
+    - num: 需要生成的实例数量。
+    - depots: 每个实例的仓库数量。
+    - cities: 每个实例的客户数量。
+    - seed: 随机种子；默认保持原实验的确定性采样语义。
+
+    输出：
+    - `(depot_list, city_list)`：按实例索引配对的仓库集合与客户集合。
+
+    实现逻辑：
+    1. 为当前客户规模创建独立随机数生成器。
+    2. 每个实例无放回采样仓库与客户节点。
+    3. 打乱采样结果后按仓库数切分，保持原有实验的数据生成方式。
+    """
+
+    # 使用局部随机数生成器，避免不同地图或客户规模之间互相污染全局随机状态。
+    random_state = np.random.RandomState(seed)
+    graph_nodes = list(graph.nodes)
+    depot_list, city_list = [], []
+    for _ in range(num):
+        # 每个实例内部保证仓库和客户节点不重复。
+        locations = random_state.choice(
+            graph_nodes,
+            depots + cities,
+            replace=False,
+        )
+        random_state.shuffle(locations)
+        depot_list.append(locations[:depots])
+        city_list.append(locations[depots:])
+    return depot_list, city_list
 
 
 def multiagent_instance_on_manhattan(
@@ -665,32 +677,18 @@ def multiagent_instance_on_manhattan(
     2. 构造图上统一的全对距离矩阵。
     3. 重复采样仓库和客户节点。
     """
-    # 固定随机种子。
-    np.random.seed(0)
-    # 读取 Manhattan 路网。
-    graph = manhattan(graph_path)
-    # 预计算卡车和无人机距离；1K/11K 实验会显式请求批次级耗时。
-    distance_result = _pairwise_distance(
-        graph,
-        return_stats=return_distance_stats,
-        show_progress=show_distance_progress,
+    # 地图和距离的准备逻辑独立后，旧接口仍然保持一次调用完成全部工作的行为。
+    graph, distance, distance_stats = prepare_manhattan_road_network(
+        graph_path,
+        show_distance_progress=show_distance_progress,
     )
-    if return_distance_stats:
-        distance, distance_stats = distance_result
-    else:
-        distance = distance_result
-    # 保存每个实例的仓库集合。
-    _depots, _cities = [], []
-    # 重复采样 `num` 次。
-    for _ in range(num):
-        # 无放回采样仓库与客户。
-        locations = np.random.choice(graph.nodes, depots + cities, replace=False)
-        # 打乱次序，避免仓库/客户分配有结构性偏差。
-        np.random.shuffle(locations)
-        # 保存当前实例的仓库集合。
-        _depots.append(locations[:depots])
-        # 保存当前实例的客户集合。
-        _cities.append(locations[depots:])
+    # 客户规模变化时只重新采样实例，不再重复构造全点对距离。
+    _depots, _cities = sample_multiagent_instances(
+        graph,
+        num,
+        depots,
+        cities,
+    )
     # 默认保持历史四元组接口；实验计时模式额外返回初始化统计。
     if return_distance_stats:
         return graph, _depots, _cities, distance, distance_stats
@@ -715,29 +713,17 @@ def multiagent_instance_on_cambridge(num, depots, cities):
     3. 若缓存缺失或与当前图规模不一致，则重新计算并写回缓存。
     4. 重复采样生成多个随机实例。
     """
-    # 固定随机种子。
     np.random.seed(0)
-    # 读取 Cambridge 路网。
     graph = cambridge()
-    # 确保缓存目录存在。
     _ensure_datasets_dir()
-    # 如果距离缓存存在且与当前图签名一致，则优先读取它。
     distance = _load_pairwise_cache(CAMBRIDGE_CACHE, graph)
     if distance is None:
-        # 若缓存不存在或与当前 Boston/Cambridge 图不一致，则直接计算距离矩阵。
         print('Preparing Cambridge/Boston pairwise distance cache.')
         distance = _pairwise_distance(graph)
-        # 将计算结果写入缓存。
         _save_pairwise_cache(CAMBRIDGE_CACHE, graph, distance)
-    # 保存每个实例的仓库采样。
     _depots, _cities = [], []
-    # 重复采样 `num` 次。
     for _ in range(num):
-        # 无放回采样仓库与客户。
         locations = np.random.choice(graph.nodes, depots + cities, replace=False)
-        # 保存当前实例的仓库集合。
         _depots.append(locations[:depots])
-        # 保存当前实例的客户集合。
         _cities.append(locations[depots:])
-    # 返回路网、采样结果与距离矩阵。
     return graph, _depots, _cities, distance

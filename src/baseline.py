@@ -47,21 +47,13 @@ class Baseline:
         实现逻辑：
         - 将输入逐项存入实例属性，供所有子类复用。
         """
-        # 保存路网图。
         self.graph = graph
-        # 保存仓库集合。
         self.depots = depots
-        # 保存客户集合。
         self.cities = cities
-        # 保存距离矩阵。
         self.distance = distance
-        # 用当前类名作为算法名称。
         self.name = self.__class__.__name__
-        # 保存无人机数量。
         self.drone = drone
-        # 保存距离上限。
         self.limit = limit
-        # 保存速度参数。
         self.speed = speed
 
     def convert(self, solution):
