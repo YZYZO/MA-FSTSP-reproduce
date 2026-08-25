@@ -37,12 +37,6 @@ from experiment_results import (
     _solve_model_with_process_data,
 )
 
-# 导入 `os`，用于读取/设置 CPU 亲和性。
-import os
-# 导入进程池工具，用于并行运行独立实验实例。
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
 
 SMALL_DATA_DIR = result_path('small', 'data')
 MANHATTAN_DATA_DIR = result_path('manhattan', 'data')
@@ -52,143 +46,6 @@ BOSTON_DATA_DIR = result_path('boston', 'data')
 def _save_array(path, array):
     ensure_dir(path.parent)
     np.save(path, np.array(array))
-
-
-# 固定使用 10 个进程并行运行实例。
-PROCESS_WORKERS = 1
-# 默认把这 10 个进程限制在当前允许 CPU 集合中的前 10 个逻辑 CPU 上。
-# 如果只想限制进程数、不想绑定 CPU，可改为 False。
-PIN_TO_PROCESS_CORES = True
-
-# 子进程中的共享只读上下文。Linux fork 模式下，大对象通常通过 copy-on-write 共享，
-# 避免每个任务反复把 graph / distance 序列化传给子进程。
-_PAR_GRAPH = None
-_PAR_DEPOTS = None
-_PAR_CITIES = None
-_PAR_DISTANCE = None
-
-
-
-def _init_process_worker(graph, depots, cities, distance, cpu_affinity=None):
-    """
-    初始化每个子进程的只读实验上下文，并按需设置 CPU 亲和性。
-    """
-    if cpu_affinity is not None and hasattr(os, 'sched_setaffinity'):
-        os.sched_setaffinity(0, set(cpu_affinity))
-
-    global _PAR_GRAPH, _PAR_DEPOTS, _PAR_CITIES, _PAR_DISTANCE
-    _PAR_GRAPH = graph
-    _PAR_DEPOTS = depots
-    _PAR_CITIES = cities
-    _PAR_DISTANCE = distance
-
-
-def _solve_instance_job(task):
-    """
-    子进程执行单个实例。
-
-    输入：
-    - task: `(algorithm, index, drones, rounds, theta)`。
-
-    输出：
-    - `(index, cost, elapsed, solution, process_data)`，包含最终路线和三阶段记录。
-    """
-    algorithm, i, drones, rounds, theta = task
-    depots = _PAR_DEPOTS[i]
-    cities = _PAR_CITIES[i]
-
-
-
-    if theta is None:
-        model = MultiAgentFlyingSidekickTSP(_PAR_GRAPH, depots, cities, _PAR_DISTANCE, drones)
-    else:
-        model = MultiAgentFlyingSidekickTSP(
-            _PAR_GRAPH, depots, cities, _PAR_DISTANCE, drones, theta=theta
-        )
-
-    if algorithm != 'stsp':
-        raise ValueError(f'当前并行实验记录器只支持 stsp，收到 algorithm={algorithm!r}')
-
-    # 使用与 `solve()` 等价的三阶段调度，同时保留绘图所需的紧凑过程数据。
-    solution, cost, process_data = _solve_model_with_process_data(model)
-    elapsed = process_data['solve_seconds']
-
-    return i, cost, elapsed, solution, process_data
-
-
-def _run_parallel_instances(
-    num,
-    graph,
-    depots,
-    cities,
-    distance,
-    algorithm,
-    drones,
-    rounds=None,
-    theta=None,
-    max_workers=PROCESS_WORKERS,
-    desc=None,
-):
-    """
-    用 10 个进程并行执行 num 个相互独立的实验实例。
-
-    注意：
-    - 这里使用 ProcessPoolExecutor，不再使用 Python 线程。
-    - 对纯 Python CPU 密集型代码，多进程可以绕开 GIL。
-    - 每个子进程通常会占用一个 CPU 核心；如果模型内部又启动 Gurobi/BLAS 多线程，
-      实际 CPU 占用可能超过 10 个核心，需要在对应求解器内部限制线程数。
-    """
-    if num <= 0:
-        return []
-
-    worker_count = min(max_workers, num)
-    results = [None] * num
-    tasks = [
-        (algorithm, i, drones, rounds, theta)
-        for i in range(num)
-    ]
-
-    try:
-        ctx = mp.get_context('fork')
-    except ValueError:
-        # 非 Linux 环境没有 fork 时退回默认启动方式。
-        ctx = mp.get_context()
-
-    cpu_affinity = None
-    if PIN_TO_PROCESS_CORES and hasattr(os, 'sched_getaffinity'):
-        allowed_cpus = sorted(os.sched_getaffinity(0))
-        cpu_affinity = tuple(allowed_cpus[:worker_count])
-        print(f'Using process pool with {worker_count} processes; CPU affinity={cpu_affinity}')
-    else:
-        print(f'Using process pool with {worker_count} processes.')
-
-    with ProcessPoolExecutor(
-        max_workers=worker_count,
-        mp_context=ctx,
-        initializer=_init_process_worker,
-        initargs=(graph, depots, cities, distance, cpu_affinity),
-    ) as executor:
-        futures = {
-            executor.submit(_solve_instance_job, task): task[1]
-            for task in tasks
-        }
-
-        for future in tqdm(as_completed(futures), total=num, desc=desc):
-            i, cost, elapsed, solution, process_data = future.result()
-            results[i] = (cost, elapsed, solution, process_data)
-
-    return results
-
-
-def _store_cost_time(costs, times, key, results):
-    """
-    将并行任务返回记录中的 cost/elapsed 写回成本表和耗时表。
-
-    输入：成本表、耗时表、算法键和实例结果列表。
-    输出：无；只更新成本和耗时，保留路线及过程数据给结果序列化模块使用。
-    """
-    costs[key] = [item[0] for item in results]
-    times[key] = [item[1] for item in results]
 
 
 def _print_distance_initialization_stats(label, stats):
@@ -214,10 +71,19 @@ def _print_distance_initialization_stats(label, stats):
 
 def test_manhattan(num, size):
     """
-    在 Manhattan 路网实例上运行 HC 和论文主算法。
+    在 Manhattan 路网实例上顺序运行论文主算法。
 
-    本版本将论文主算法在 num 个实例上的求解改为 10 进程并行。
-    原文件中的 HC 部分本来就是注释状态，这里保持不运行 HC。
+    输入：
+    - num: 随机实例数量。
+    - size: 每个实例的客户数量。
+
+    输出：
+    - 无显式返回值；打印平均成本与耗时，并保存包含路线和三阶段记录的批次结果。
+
+    实现逻辑：
+    1. 一次性生成共享路网、距离数据和全部随机实例。
+    2. 按实例索引在主进程中依次构造并求解模型。
+    3. 汇总结果，同时保留现有 NPZ 结果结构。
     """
     # 生成 Manhattan 路网实例集合。
     graph, depots, cities, distance = multiagent_instance_on_manhattan(num, 5, size)
@@ -225,14 +91,24 @@ def test_manhattan(num, size):
     costs = {'hc': [], 'stsp': [], 'lp': []}
     # 为两种算法创建耗时记录表。
     times = {'hc': [], 'stsp': [], 'lp': []}
+    # 按实例顺序保存成本、耗时、路线和三阶段过程数据。
+    stsp_results = []
 
-    print(f'Running Manhattan experiment with {PROCESS_WORKERS} processes.')
+    print('Running Manhattan experiment serially.')
 
-    stsp_results = _run_parallel_instances(
-        num, graph, depots, cities, distance,
-        algorithm='stsp', drones=3, theta=(0.5, 0.5), desc='Manhattan-STSP'
-    )
-    _store_cost_time(costs, times, 'stsp', stsp_results)
+    # 恢复官方仓库的顺序循环风格，避免为每批实例创建额外子进程。
+    for i in tqdm(range(num), desc='Manhattan-STSP'):
+        # 当前实例的仓库和客户必须使用同一个索引配对。
+        depot, city = depots[i], cities[i]
+        model = MultiAgentFlyingSidekickTSP(
+            graph, depot, city, distance, 3, theta=(0.5, 0.5)
+        )
+        # 保留扩展结果模块需要的最终路线与三阶段紧凑记录。
+        solution, cost, process_data = _solve_model_with_process_data(model)
+        elapsed = process_data['solve_seconds']
+        stsp_results.append((cost, elapsed, solution, process_data))
+        costs['stsp'].append(cost)
+        times['stsp'].append(elapsed)
 
     # 输出论文主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
@@ -250,10 +126,19 @@ def test_manhattan(num, size):
 
 def test_cambridge(num, size):
     """
-    在 Cambridge 路网实例上运行 HC 和论文主算法。
+    在 Cambridge 路网实例上顺序运行论文主算法。
 
-    本版本将论文主算法在 num 个实例上的求解改为 10 进程并行。
-    原文件中的 HC 部分本来就是注释状态，这里保持不运行 HC。
+    输入：
+    - num: 随机实例数量。
+    - size: 每个实例的客户数量。
+
+    输出：
+    - 无显式返回值；打印平均成本与耗时，并保存包含路线和三阶段记录的批次结果。
+
+    实现逻辑：
+    1. 一次性生成共享路网、距离数据和全部随机实例。
+    2. 按实例索引在主进程中依次构造并求解模型。
+    3. 汇总结果，同时保留现有 NPZ 结果结构。
     """
     # 生成 Cambridge 路网实例集合。
     graph, depots, cities, distance = multiagent_instance_on_cambridge(num, 10, size)
@@ -261,14 +146,24 @@ def test_cambridge(num, size):
     costs = {'hc': [], 'stsp': [], 'lp': []}
     # 为两种算法创建耗时记录表。
     times = {'hc': [], 'stsp': [], 'lp': []}
+    # 按实例顺序保存成本、耗时、路线和三阶段过程数据。
+    stsp_results = []
 
-    print(f'Running Cambridge experiment with {PROCESS_WORKERS} processes.')
+    print('Running Cambridge experiment serially.')
 
-    stsp_results = _run_parallel_instances(
-        num, graph, depots, cities, distance,
-        algorithm='stsp', drones=3, theta=(0.5, 0.5), desc='Cambridge-STSP'
-    )
-    _store_cost_time(costs, times, 'stsp', stsp_results)
+    # 恢复官方仓库的顺序循环风格，避免为每批实例创建额外子进程。
+    for i in tqdm(range(num), desc='Cambridge-STSP'):
+        # 当前实例的仓库和客户必须使用同一个索引配对。
+        depot, city = depots[i], cities[i]
+        model = MultiAgentFlyingSidekickTSP(
+            graph, depot, city, distance, 3, theta=(0.5, 0.5)
+        )
+        # 保留扩展结果模块需要的最终路线与三阶段紧凑记录。
+        solution, cost, process_data = _solve_model_with_process_data(model)
+        elapsed = process_data['solve_seconds']
+        stsp_results.append((cost, elapsed, solution, process_data))
+        costs['stsp'].append(cost)
+        times['stsp'].append(elapsed)
 
     # 输出主算法平均表现。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
@@ -316,14 +211,24 @@ def test_manhattan_1k(num, size):
     costs = {'hc': [], 'stsp': [], 'lp': []}
     times = {'hc': [], 'stsp': [], 'lp': []}
 
-    print(f'Running Manhattan 1K experiment with {PROCESS_WORKERS} processes.')
+    # 按实例顺序保存成本、耗时、路线和三阶段过程数据。
+    stsp_results = []
+
+    print('Running Manhattan 1K experiment serially.')
 
     # 主算法默认使用 1.5 km 航程和 1.6 倍无人机速度，仅显式传入论文阈值。
-    stsp_results = _run_parallel_instances(
-        num, graph, depots, cities, distance,
-        algorithm='stsp', drones=3, theta=(0.5, 0.5), desc='Manhattan-1K-STSP'
-    )
-    _store_cost_time(costs, times, 'stsp', stsp_results)
+    for i in tqdm(range(num), desc='Manhattan-1K-STSP'):
+        # 当前实例的仓库和客户必须使用同一个索引配对。
+        depot, city = depots[i], cities[i]
+        model = MultiAgentFlyingSidekickTSP(
+            graph, depot, city, distance, 3, theta=(0.5, 0.5)
+        )
+        # 顺序求解并保留绘图、校验所需的紧凑过程数据。
+        solution, cost, process_data = _solve_model_with_process_data(model)
+        elapsed = process_data['solve_seconds']
+        stsp_results.append((cost, elapsed, solution, process_data))
+        costs['stsp'].append(cost)
+        times['stsp'].append(elapsed)
 
     # 输出本批次主算法的平均成本和平均求解时间。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
@@ -373,14 +278,24 @@ def test_manhattan_11k(num, size):
     costs = {'hc': [], 'stsp': [], 'lp': []}
     times = {'hc': [], 'stsp': [], 'lp': []}
 
-    print(f'Running Boston 11K reproduction with {PROCESS_WORKERS} processes.')
+    # 按实例顺序保存成本、耗时、路线和三阶段过程数据。
+    stsp_results = []
+
+    print('Running Boston 11K reproduction serially.')
 
     # 主算法默认使用 1.5 km 航程和 1.6 倍无人机速度，仅显式传入论文阈值。
-    stsp_results = _run_parallel_instances(
-        num, graph, depots, cities, distance,
-        algorithm='stsp', drones=4, theta=(0.5, 0.5), desc='Boston-11K-STSP'
-    )
-    _store_cost_time(costs, times, 'stsp', stsp_results)
+    for i in tqdm(range(num), desc='Boston-11K-STSP'):
+        # 当前实例的仓库和客户必须使用同一个索引配对。
+        depot, city = depots[i], cities[i]
+        model = MultiAgentFlyingSidekickTSP(
+            graph, depot, city, distance, 4, theta=(0.5, 0.5)
+        )
+        # 顺序求解并保留绘图、校验所需的紧凑过程数据。
+        solution, cost, process_data = _solve_model_with_process_data(model)
+        elapsed = process_data['solve_seconds']
+        stsp_results.append((cost, elapsed, solution, process_data))
+        costs['stsp'].append(cost)
+        times['stsp'].append(elapsed)
 
     # 输出本批次主算法的平均成本和平均求解时间。
     print(f'Our algorithm gives solution with cost {sum(costs["stsp"]) / num} in {sum(times["stsp"]) / num}s')
