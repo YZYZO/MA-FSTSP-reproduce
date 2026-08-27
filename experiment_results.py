@@ -12,6 +12,8 @@
 """
 
 import json
+import os
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -29,10 +31,34 @@ def _save_npz(path, **arrays):
     - path: 目标文件路径。
     - arrays: 需要保存的命名数组。
 
-    输出：无；负责创建父目录并写入压缩结果文件。
+    输出：无；负责创建父目录并原子替换压缩结果文件。
+
+    实现逻辑：
+    1. 在目标目录创建临时文件并完整写入压缩数组。
+    2. 刷新文件缓冲区后使用原子替换提交结果。
+    3. 写入失败时删除临时文件，保留原有目标文件不变。
     """
-    ensure_dir(Path(path).parent)
-    np.savez_compressed(path, **arrays)
+    path = Path(path)
+    ensure_dir(path.parent)
+    temporary_path = None
+    try:
+        # 临时文件与目标文件位于同一目录，确保最终替换不会跨文件系统。
+        with tempfile.NamedTemporaryFile(
+            mode='w+b',
+            dir=path.parent,
+            prefix=f'.{path.name}.',
+            suffix='.tmp',
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            np.savez_compressed(stream, **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def _jsonable(value):
