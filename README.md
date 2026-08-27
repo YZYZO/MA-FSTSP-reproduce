@@ -12,23 +12,38 @@ git clone https://github.com/Brelliothe/MixTSP.git
 ```
 Run the following command to install the required packages:
 ```bash
-conda create -n MixTSP python=3.7
-conda activate MixTSP
+conda create -n MA-FSTSP python=3.10
+conda activate MA-FSTSP
 pip install -r requirements.txt
 ```
 
 ## Reproduce Guide
 You can find our algorithm implemented in file `src/fstsp.py` and all other baselines in the same folder. 
-To run all the experiments in the paper, you can use 
+Run the paired Phase-1 pilot with:
 ```bash
 python experiments.py
 ```
-`run_full_experiments()` runs the 1K, 11K, and 55K NYC road networks in that order. Each map initializes its pairwise road/drone distances once, then reuses them for 50, 100, and 150 customers before releasing the distance matrices. The 1K scale uses 5 depots and 3 drones per truck; the 11K and 55K scales use 10 depots and 4 drones per truck. The 11K reproduction keeps the historical `boston_11k` result name, while the 55K experiment uses `datasets/nyc.graphml` and the `manhattan_55k` result name.
+The no-argument command uses the V2 `PILOT_PROTOCOL`: Manhattan 1K, 50 customers, 10 paired instances, and a 600-second instance limit. Every partition method receives the same sampled depots and customers.
 
-The default command runs 100 instances for every map/customer-size combination and is intended for the large-memory server. Run the lightweight orchestration tests locally without loading the real maps:
+The formal protocol must be selected explicitly because it runs 100 paired instances for every map/customer-size setting:
+
+```bash
+python experiments.py --protocol formal
+```
+
+The 11K graph in this repository is labeled `NYC 11K proxy`; it is not presented as the paper's Boston road network. Run the lightweight tests locally without loading the real maps:
 
 ```powershell
-& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -m unittest tests.test_map_scale_batch_initialization -v
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" -m unittest discover -s tests -p "test_*.py"
+```
+
+The main comparison is `smst_original`, `snn`, `set_gtds_no_budget`, and `directed_set_gtds`. Main GTDS variants use all available depots and the paper's `1/speed` drone-cost factor. Epsilon, free-depot, and legacy `sqrt(2)/speed` studies are separate CLI protocols: `epsilon`, `active-depot`, and `cost-factor`.
+
+Analyze a V2 summary and draw the required mechanism plots with:
+
+```powershell
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" analyze_paired_results.py results\paired\phase1_pilot_v2\manhattan_1k\50\paired_summary.npz --cutoff 600
+& "D:\Anaconda3\envs\MA-FSTSP\python.exe" plot_paired_mechanisms.py results\paired\phase1_pilot_v2\manhattan_1k\50\paired_summary.npz
 ```
 
 Boston/Cambridge OSM download settings are colocated with the map-loading implementation in `problem.py`. Download and refresh are disabled by default, and both switches must be enabled before the code accesses Overpass.
@@ -48,6 +63,7 @@ New road-network NPZ files include the sampled depots/customers, final truck/dro
 Outputs are written under `results/`:
 
 - `results/manhattan/data`, `results/manhattan/figures`, `results/manhattan/maps`
+- `results/nyc_proxy/data`
 - `results/boston/data`, `results/boston/figures`, `results/boston/maps`
 - `results/small/data`, `results/small/figures`
 

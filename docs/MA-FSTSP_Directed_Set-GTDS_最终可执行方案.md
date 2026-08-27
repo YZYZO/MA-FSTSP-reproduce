@@ -57,7 +57,7 @@ groups = {
 
 - 每个客户恰好分配一次；
 - 每个仓库至多对应巨路径上的一个连续客户片段；
-- 允许部分仓库没有客户；
+- 算法接口允许部分仓库没有客户，但 V2 主实验在客户数不少于仓库数时要求全部仓库非空；
 - 每个非空客户分组均满足 Set-TSP 模型规模约束。
 
 ---
@@ -110,9 +110,12 @@ def normalize_candidate_sets(cities, raw_sets):
 \psi_u(x)=
 \begin{cases}
 0, & u\in P,\\
-\dfrac{\sqrt 2}{s_{dr}}d^{dr}(u,x), & u\in C.
+\dfrac{1}{s_{dr}}d^{dr}(u,x), & u\in C.
 \end{cases}
 \]
+
+该系数直接对应论文式（3）。公开 SMST 代码使用的
+\(\sqrt 2/s_{dr}\) 只保留为 `gtds_sqrt2` 敏感性实验，不用于 V2 主结果。
 
 ### 4.2 有向集合代价
 
@@ -838,9 +841,11 @@ estimated_q_con == model.NumConstrs
 
 1. `SMST-original + STSP`：公开代码原始第一阶段；
 2. `SNN + STSP`：最近仓库类型的速度参考；
-3. `Directed Set-GTDS + STSP`：本文方法。
+3. `Set-GTDS-noBudget + STSP`：相同有向代价与 Split、不使用模型规模预算；
+4. `Directed Set-GTDS + STSP`：本文完整方法。
 
-所有方法使用完全相同的 Phase 2、Phase 3、实例和随机种子。
+所有方法使用完全相同的 Phase 2、Phase 3、实例和随机种子，并按实例采用确定性的
+循环平衡执行顺序。两个 GTDS 主方法固定使用全部可用仓库和论文 `1/speed` 代价。
 
 ### 15.2 数据规模
 
@@ -849,9 +854,12 @@ estimated_q_con == model.NumConstrs
 | 路网 | 仓库数 | 客户数 |
 |---|---:|---:|
 | Manhattan | 5 | 50、100、150 |
-| Boston | 10 | 50、100、150 |
+| NYC 11K proxy | 10 | 50、100、150 |
 
 每个设置运行相同的 100 个实例。
+
+NYC 11K proxy 只用于扩展规模验证，不表述为论文 Boston 数据；获得真实 Boston
+图后必须使用新的数据集标识和图哈希另起实验目录。
 
 ### 15.3 主参数
 
@@ -971,7 +979,7 @@ ATSP solver = elkai
 
 ### 15.8 消融实验
 
-仅设置一个机制消融：
+主表包含一个机制消融：
 
 - `Set-GTDS-noBudget`：使用相同有向代价、相同巨路径和相同仓库子集 Split，但不限制 \(Q_{bin}\)；
 - `Directed Set-GTDS`：使用完整的 1% 代理成本约束和最小模型规模预算。
@@ -980,6 +988,12 @@ ATSP solver = elkai
 
 - 巨路径和仓库联合 Split 带来的收益；
 - 下游模型规模约束带来的收益。
+
+另外单独运行两组口径敏感性，不并入主表：
+
+- `directed_set_gtds` 对 `gtds_free_eps01`：识别“全部仓库非空”约束的影响；
+- `directed_set_gtds` 对 `gtds_sqrt2`：识别论文 `1/speed` 与公开代码
+  `sqrt(2)/speed` 代价口径的影响。
 
 ---
 
@@ -1088,9 +1102,11 @@ O(2^m n).
 先运行：
 
 ```text
-Manhattan：5 个仓库，50 个客户，10 个实例
-Boston：10 个仓库，50 个客户，10 个实例
+Manhattan 1K：5 个仓库，50 个客户，10 个实例
 ```
+
+当前仓库没有论文 Boston 路网；NYC 11K 仅作为单独标注的 proxy 数据，不能写成
+Boston 复现实验。
 
 检查：
 
@@ -1110,7 +1126,7 @@ Boston：10 个仓库，50 个客户，10 个实例
 2 个路网
 3 个客户规模
 每个设置 100 个实例
-3 个主对照方法
+4 个主比较方法
 1 个机制消融
 ```
 
@@ -1132,7 +1148,11 @@ ATSP 求解器：elkai
 下游复杂度指标：Set-TSP 预求解二进制变量数 Q_bin
 代理成本容忍度：epsilon = 0.01
 Split 方法：仓库子集动态规划
+主实验活跃仓库策略：all（客户数不少于仓库数时全部非空）
+主实验无人机代价系数：1 / speed
 主实验仓库范围：m <= 10
+Pilot 实例总时限：600 秒
+正式实验实例总时限：7200 秒
 Phase 2：保持不变
 Phase 3：保持不变
 原 MST：保留为 SMST-original 基线，不修改

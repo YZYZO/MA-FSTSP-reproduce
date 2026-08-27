@@ -3,19 +3,31 @@
 
 主要内容：
 1. 先为客户构造候选服务区域（文中称 convex sets）。
-2. 再用 MST 思路把客户划分给不同仓库。
+2. 使用配置的 SMST 或 Directed Set-GTDS 把客户划分给不同仓库。
 3. 对每个仓库组求一个集合化 TSP 顺序。
 4. 最后通过动态规划近似联合优化卡车与多架无人机的同步路线。
 """
 
 import elkai
-import gurobipy as gp
-from gurobipy import GRB
 import math
+import time
 import networkx as nx
 import numpy as np
 from .baseline import Baseline
+from .partition import normalize_candidate_sets, set_gtds_partition
+from .set_tsp_solver import SetTSPSolveResult, solve_set_tsp
 from utils import mst_partition
+
+
+class InstanceTimeLimitExceeded(TimeoutError):
+    """表示实例级时间预算已在不可中断的 Phase 3 计算中耗尽。"""
+
+
+def _check_instance_deadline(deadline):
+    """检查绝对截止时间；输入为 ``perf_counter`` 时间戳，超时则抛出异常。"""
+
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise InstanceTimeLimitExceeded('实例级时间预算已耗尽')
 
 
 class MultiAgentFlyingSidekickTSP(Baseline):
@@ -40,13 +52,48 @@ class MultiAgentFlyingSidekickTSP(Baseline):
     2. 为每个仓库准备客户分组容器。
     3. 预计算每个客户的可服务区域。
     """
-    def __init__(self, graph, depots, cities, distance, drone, limit=1.5, speed=1.6, theta=(0.5, 0.5)):
+    def __init__(
+        self,
+        graph,
+        depots,
+        cities,
+        distance,
+        drone,
+        limit=1.5,
+        speed=1.6,
+        theta=(0.5, 0.5),
+        partition_method='smst_original',
+        partition_epsilon=0.01,
+        partition_scale=1000,
+        partition_min_active_depots=None,
+        partition_active_depot_policy='all',
+        partition_drone_cost_mode='paper',
+        set_tsp_time_limit=None,
+        precomputed_partition_result=None,
+    ):
         super().__init__(graph, depots, cities, distance, drone, limit, speed)
         self.groups = {depot: [] for depot in depots}
         self.solution = []
         self.cost = 0
         self.theta = theta
         self.const = math.sqrt(2)
+        # 第一阶段默认继续使用公开代码中的 SMST，实验入口可显式切换到新方法。
+        self.partition_method = partition_method
+        self.partition_epsilon = partition_epsilon
+        self.partition_scale = partition_scale
+        # 显式整数约束用于兼容旧实验；未指定时由 ``all/free`` 策略统一决定。
+        self.partition_min_active_depots = (
+            None
+            if partition_min_active_depots is None
+            else int(partition_min_active_depots)
+        )
+        self.partition_active_depot_policy = partition_active_depot_policy
+        # GTDS 主实验遵循论文式（3）的 1/speed；sqrt(2)/speed 仅用于敏感性实验。
+        self.partition_drone_cost_mode = partition_drone_cost_mode
+        # 默认不设置 Set-TSP 上限；实验协议可以显式传入正数以研究超时行为。
+        self.set_tsp_time_limit = set_tsp_time_limit
+        self.partition_result = precomputed_partition_result
+        self.precomputed_partition_result = precomputed_partition_result
 
         #语法：解包并合并两个字典，键相同时后面覆盖前面
         #作用：首先对客户节点（city），搜索整个图，保留无人机航程内的地图节点，组成键值对，构成客户集合
@@ -128,6 +175,140 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                 graph.add_edge(city, _city, weight=weight)
         self.groups = mst_partition(graph, self.depots, self.cities)
 
+    def set_gtds(
+        self,
+        candidate_sets,
+        apply_model_budget=True,
+        epsilon=None,
+        min_active_depots=None,
+        active_depot_policy=None,
+        drone_cost_mode=None,
+    ):
+        """
+        使用 Directed Set-GTDS 将客户划分给各仓库。
+
+        输入：正规化候选集合、模型预算开关、epsilon、活跃仓库策略和无人机代价模式。
+        输出：无显式返回值；分组写入 ``self.groups``，诊断结果写入
+        ``self.partition_result``。
+        逻辑：把当前模型的仓库、客户、距离与速度交给独立分区模块，Phase 2/3
+        仍沿用本类原有实现。
+        """
+
+        # 显式参数优先于模型默认值，使具名消融方法不会隐式修改模型配置。
+        effective_epsilon = (
+            self.partition_epsilon if epsilon is None else float(epsilon)
+        )
+        effective_min_active = (
+            self.partition_min_active_depots
+            if min_active_depots is None
+            else int(min_active_depots)
+        )
+        effective_policy = (
+            self.partition_active_depot_policy
+            if active_depot_policy is None
+            else active_depot_policy
+        )
+        effective_drone_cost_mode = (
+            self.partition_drone_cost_mode
+            if drone_cost_mode is None
+            else drone_cost_mode
+        )
+        result = set_gtds_partition(
+            depots=list(self.depots),
+            cities=list(self.cities),
+            candidate_sets=candidate_sets,
+            truck_distance=self.distance['truck'],
+            drone_distance=self.distance['drone'],
+            speed=self.speed,
+            epsilon=effective_epsilon,
+            scale=self.partition_scale,
+            apply_model_budget=apply_model_budget,
+            min_active_depots=effective_min_active,
+            active_depot_policy=effective_policy,
+            drone_cost_mode=effective_drone_cost_mode,
+        )
+        self.groups = result.groups
+        self.partition_result = result
+
+    def partition_customers(self, candidate_sets):
+        """
+        按配置选择第一阶段客户划分方法。
+
+        输入：Phase 1 与 Phase 2 共用的正规化候选集合。
+        输出：无显式返回值；更新 ``self.groups`` 和可选的分区诊断结果。
+        逻辑：默认调用原始 SMST；新方法和无预算消融只通过显式方法名启用。
+        """
+
+        self.groups = {depot: [] for depot in self.depots}
+        if self.precomputed_partition_result is not None:
+            self.partition_result = self.precomputed_partition_result
+            self.groups = {
+                depot: list(self.partition_result.groups.get(depot, []))
+                for depot in self.depots
+            }
+            return
+        self.partition_result = None
+        if self.partition_method == 'smst_original':
+            self.set_mst(candidate_sets)
+        elif self.partition_method == 'snn':
+            self.set_nn(self.theta[0])
+        elif self.partition_method == 'directed_set_gtds':
+            self.set_gtds(
+                candidate_sets,
+                apply_model_budget=True,
+                active_depot_policy='all',
+                drone_cost_mode='paper',
+            )
+        elif self.partition_method == 'set_gtds_no_budget':
+            self.set_gtds(
+                candidate_sets,
+                apply_model_budget=False,
+                active_depot_policy='all',
+                drone_cost_mode='paper',
+            )
+        elif self.partition_method == 'gtds_sqrt2':
+            self.set_gtds(
+                candidate_sets,
+                apply_model_budget=True,
+                active_depot_policy='all',
+                drone_cost_mode='smst_compatible',
+            )
+        elif self.partition_method == 'gtds_free_eps01':
+            self.set_gtds(
+                candidate_sets,
+                epsilon=0.01,
+                active_depot_policy='free',
+            )
+        elif self.partition_method == 'gtds_free_eps05':
+            self.set_gtds(candidate_sets, epsilon=0.05, min_active_depots=1)
+        elif self.partition_method == 'gtds_free_eps10':
+            self.set_gtds(candidate_sets, epsilon=0.10, min_active_depots=1)
+        elif self.partition_method == 'gtds_all_eps01':
+            self.set_gtds(
+                candidate_sets,
+                epsilon=0.01,
+                active_depot_policy='all',
+            )
+        elif self.partition_method.startswith('gtds_all_eps'):
+            epsilon_codes = {
+                '000': 0.0,
+                '005': 0.005,
+                '010': 0.01,
+                '020': 0.02,
+                '050': 0.05,
+            }
+            epsilon_code = self.partition_method.removeprefix('gtds_all_eps')
+            if epsilon_code not in epsilon_codes:
+                raise ValueError(f'未知的 epsilon 敏感性方法：{self.partition_method!r}')
+            self.set_gtds(
+                candidate_sets,
+                epsilon=epsilon_codes[epsilon_code],
+                active_depot_policy='all',
+                drone_cost_mode='paper',
+            )
+        else:
+            raise ValueError(f'未知的第一阶段划分方法：{self.partition_method!r}')
+
     @staticmethod
     def cut_off(x, y):
         """
@@ -166,81 +347,14 @@ class MultiAgentFlyingSidekickTSP(Baseline):
             route = elkai.DistanceMatrix(int_matrix).solve_tsp()
             return route
 
-    @staticmethod
-    def set_tsp(convex_sets, distance, convex_set_distance):
-        """
-        求解集合化 TSP 顺序问题。
-
-        输入：
-        - convex_sets: 各客户或仓库对应的候选点集合。
-        - distance: 不同集合间候选点两两距离。
-        - convex_set_distance: 同一集合内部起点/终点切换代价。
-
-        输出：
-        - 一个访问顺序 `seq`。
-
-        实现逻辑：
-        1. 建立集合层面的 TSP 顺序变量。
-        2. 建立集合内部节点选择变量和集合间连接变量。
-        3. 用 Gurobi 求解后恢复访问顺序。
-        """
-        n = len(convex_sets)
-        model = gp.Model('Set-TSP')
-        #日志输出设置
-        model.setParam("OutputFlag", 0)
-        # first write a tsp for the visiting order of convex sets using GG model
-        select = model.addMVar((n, n), vtype=GRB.BINARY)
-        model.addConstrs(select[u, u] == 0 for u in range(n))
-        model.addConstrs(np.ones((n,)) @ select[:, v] == 1 for v in range(n))
-        model.addConstrs(np.ones((n,)) @ select[u, :] == 1 for u in range(n))
-        flow = model.addMVar((n, n), vtype=GRB.CONTINUOUS)
-        model.addConstrs(flow[u, v] <= n * select[u, v] for u in range(n) for v in range(n))
-        model.addConstr(np.ones((n,)) @ flow[0, :] == n - 1)
-        model.addConstr(np.ones((n,)) @ flow[:, 0] == 0)
-        model.addConstrs(flow[u, u] == 0 for u in range(n))
-        model.addConstrs(np.ones((n,)) @ flow[:, v] - np.ones((n,)) @ flow[v, :] == 1 for v in range(1, n))
-
-        # internal is the selection of node pair inside each convex set
-        internal = [[[model.addVar(vtype=GRB.BINARY) for _ in convex_set] for _ in convex_set] for convex_set in
-                    convex_sets]
-        # external is the selection of node pair between two convex sets
-        external = [[[[model.addVar(vtype=GRB.BINARY) for _ in v] for _ in u] for v in convex_sets] for u in
-                    convex_sets]
-        model.addConstrs(gp.quicksum([internal[i][j][k] for j in range(len(convex_sets[i]))
-                                      for k in range(len(convex_sets[i]))]) == 1 for i in range(n))
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for i in range(len(convex_sets[u]))
-                                      for j in range(len(convex_sets[v]))]) == select[u, v]
-                         for u in range(n) for v in range(n))
-        # node j in convex sets v should have same out degree internal and in degree external
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for u in range(n) for i in range(len(convex_sets[u]))]) ==
-                         gp.quicksum([internal[v][j][k] for k in range(len(convex_sets[v]))]) for v in range(n)
-                         for j in range(len(convex_sets[v])))
-        # node i in convex sets u should have same in degree internal and out degree external
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for v in range(n) for j in range(len(convex_sets[v]))]) ==
-                         gp.quicksum([internal[u][k][i] for k in range(len(convex_sets[u]))]) for u in range(n)
-                         for i in range(len(convex_sets[u])))
-        model.setObjective(gp.quicksum([convex_set_distance[i][j][k] * internal[i][j][k] for i in range(n)
-                                        for j in range(len(convex_sets[i])) for k in range(len(convex_sets[i]))]) +
-                           gp.quicksum([distance[u][v][i][j] * external[u][v][i][j] for u in range(n) for v in range(n)
-                                        for i in range(len(convex_sets[u])) for j in range(len(convex_sets[v]))]),
-                           GRB.MINIMIZE)
-        model.optimize()
-
-        seq = [0]
-        while seq.count(0) < 2:
-            for j in range(n):
-                if select[seq[-1], j].X > 0.99:
-                    seq.append(j)
-                    break
-        return seq
-
-    def local_search_multi_drone_appr(self, seq, depot):
+    def local_search_multi_drone_appr(self, seq, depot, deadline=None):
         """
         在给定客户顺序下，用动态规划近似优化多无人机联合调度。
 
         输入：
         - seq: 客户访问顺序，首尾均为仓库。
         - depot: 当前仓库节点。
+        - deadline: 可选的 ``perf_counter`` 绝对截止时间。
 
         输出：
         - `(solution, cost)`：
@@ -255,6 +369,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
 
 
 
+        _check_instance_deadline(deadline)
         # value as defined in Eq. (13)
         value = [{node: float('inf') for node in self.graph.nodes} for _ in range(2 * len(seq) - 2)]
         value[0][depot] = 0
@@ -269,7 +384,10 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         prefix[0][depot]['truck'] = [depot]
 
         for i in range(1, len(seq) - 1):
+            # Phase 3 不依赖外部求解器，因此在主要 DP 层之间主动检查实例级截止时间。
+            _check_instance_deadline(deadline)
             for node in self.regions[seq[i]]:
+                _check_instance_deadline(deadline)
                 for _node in self.regions[seq[i]]:
                     # initialize appr as Eq. (8)
                     drone_time = self.distance['drone'][seq[i]][_node] + self.distance['drone'][seq[i]][node]
@@ -291,6 +409,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                 else:
                     break
             for j in range(1, group[i - 1]):
+                _check_instance_deadline(deadline)
                 # assume throw all together, then
                 for node in self.regions[seq[i]]:
                     for _node in self.regions[seq[i - j]]:
@@ -313,7 +432,9 @@ class MultiAgentFlyingSidekickTSP(Baseline):
             #print("@")
 
         for i in range(1, len(seq) - 1):
+            _check_instance_deadline(deadline)
             for node in self.regions[seq[i]]:
+                _check_instance_deadline(deadline)
                 for _node in self.regions[seq[i - 1]]:
                     # initialize value as Eq. (12)
                     if value[2 * i - 2][_node] + self.distance['truck'][_node][node] < value[2 * i - 1][node]:
@@ -322,6 +443,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                         prefix[2 * i - 1][node]['drone'] = prefix[2 * i - 2][_node]['drone'].copy()
 
             for j in range(min(self.drone, i)):
+                _check_instance_deadline(deadline)
                 for node in self.regions[seq[i]]:
                     for _node in self.regions[seq[i - j]]:
                         # approximation method to estimate the time consumption as Eq. (13)
@@ -334,6 +456,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                             prefix[2 * i][node]['drone'] = prefix[2 * i - 2 * j - 1][_node]['drone'].copy() + \
                                                            tour[i - 1][j][node][_node]['drone'].copy()
 
+        _check_instance_deadline(deadline)
         for node in self.regions[seq[-2]]:
             # after visiting the last customer, return to the depot
             if value[2 * len(seq) - 4][node] + self.distance['truck'][node][depot] < value[2 * len(seq) - 3][depot]:
@@ -342,6 +465,102 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                 prefix[2 * len(seq) - 3][depot]['drone'] = prefix[2 * len(seq) - 4][node]['drone'].copy()
 
         return prefix[2 * len(seq) - 3][depot], value[2 * len(seq) - 3][depot]
+
+
+    @staticmethod
+    def set_tsp(
+        convex_sets,
+        distance,
+        convex_set_distance,
+        time_limit=None,
+    ):
+        """
+        求解 Set-TSP 并返回访问序列的兼容接口。
+
+        输入为候选集合、两类代价和可选时限；内部调用独立求解模块。输出访问序列；
+        若没有 incumbent 则抛出带状态信息的异常，正式实验应使用 ``get_seq_result``
+        读取结构化失败状态。
+        """
+
+        result = solve_set_tsp(
+            convex_sets,
+            distance,
+            convex_set_distance,
+            time_limit=time_limit,
+        )
+        if result.sequence is None:
+            raise RuntimeError(
+                f'Set-TSP 未产生可用解：{result.status}; '
+                f'{result.error_message or "无额外错误信息"}'
+            )
+        return result.sequence
+
+    def get_seq_result(self, depot, convex_sets, time_limit=None):
+        """
+        求解当前仓库的访问顺序并返回统一遥测对象。
+
+        输入为仓库节点、该仓库的候选集合列表和可选本次时限；LKH 分支生成零模型
+        规模的启发式遥测，Set-TSP 分支记录真实建模/优化状态。输出 ``SetTSPSolveResult``。
+        """
+
+        if self.theta[1] == 0:
+            start = time.perf_counter()
+            sequence = self.lkh(depot, self.groups[depot])
+            return SetTSPSolveResult(
+                sequence=sequence,
+                status='heuristic_complete',
+                objective=None,
+                build_seconds=0.0,
+                optimize_seconds=time.perf_counter() - start,
+                num_bin_vars=0,
+                num_vars=0,
+                num_constraints=0,
+                node_count=None,
+                mip_gap=None,
+                solution_count=1,
+                time_limit_reached=False,
+                has_incumbent=True,
+            )
+
+        set_distance = [
+            [
+                [
+                    max(
+                        self.distance['truck'][leave][entry],
+                        self.cut_off(
+                            self.distance['drone'][entry][city]
+                            + self.distance['drone'][city][leave],
+                            self.limit,
+                        ),
+                    ) / self.speed
+                    for entry in convex_set
+                ]
+                for leave in convex_set
+            ]
+            for convex_set, city in zip(
+                convex_sets,
+                [depot] + self.groups[depot],
+            )
+        ]
+        distance = [
+            [
+                [
+                    [self.distance['truck'][start][end] for end in target_set]
+                    for start in source_set
+                ]
+                for target_set in convex_sets
+            ]
+            for source_set in convex_sets
+        ]
+        effective_time_limit = (
+            self.set_tsp_time_limit if time_limit is None else time_limit
+        )
+        return solve_set_tsp(
+            convex_sets,
+            distance,
+            set_distance,
+            time_limit=effective_time_limit,
+        )
 
     def get_seq(self, depot, convex_sets):
         """
@@ -358,17 +577,13 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         - 若关闭集合 TSP，则调用 `lkh`；
           否则构造集合化距离并调用 `set_tsp`。
         """
-        if self.theta[1] == 0:
-            seq = self.lkh(depot, self.groups[depot])
-        else:
-            set_distance = [[[max(self.distance['truck'][k][j],
-                                  self.cut_off((self.distance['drone'][j][city] + self.distance['drone'][city][k]),
-                                               self.limit)) / self.speed for j in convex_set] for k in convex_set]
-                            for convex_set, city in zip(convex_sets, [depot] + self.groups[depot])]
-            distance = [[[[self.distance['truck'][i][j] for j in v] for i in u]
-                         for v in convex_sets] for u in convex_sets]
-            seq = self.set_tsp(convex_sets, distance, set_distance)
-        return seq
+        result = self.get_seq_result(depot, convex_sets)
+        if result.sequence is None:
+            raise RuntimeError(
+                f'Set-TSP 未产生可用解：{result.status}; '
+                f'{result.error_message or "无额外错误信息"}'
+            )
+        return result.sequence
 
     def single_solution(self, depot, convex_sets):
         """
@@ -478,14 +693,15 @@ class MultiAgentFlyingSidekickTSP(Baseline):
 
         实现逻辑：
         1. 先构造边界候选点集合。
-        2. 再用 MST 给客户分仓库。
+        2. 再用配置的第一阶段方法给客户分仓库。
         3. 对每个仓库单独求解联合路线。
         4. 汇总所有仓库的结果。
         """
         #获取客户服务范围（集合）内的边界点，加速计算
-        convex_sets = self.get_boundary_convex_sets(self.theta[0])
-        #用mst算法为仓库分配对应的客户
-        self.set_mst(convex_sets)
+        raw_sets = self.get_boundary_convex_sets(self.theta[0])
+        # Phase 1 和 Phase 2 共享同一份非空候选集合，空边界退化为客户自身。
+        convex_sets = normalize_candidate_sets(self.cities, raw_sets)
+        self.partition_customers(convex_sets)
         #对每个仓库（每个客户分组） 
         for depot in self.depots:     
             #创建当前仓库及其对应客户的点集合 的集合convex_set
@@ -513,8 +729,9 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         3. 输出不同无人机数下的成本。
         """
         costs = []
-        convex_sets = self.get_boundary_convex_sets(self.theta[0])
-        self.set_mst(convex_sets)
+        raw_sets = self.get_boundary_convex_sets(self.theta[0])
+        convex_sets = normalize_candidate_sets(self.cities, raw_sets)
+        self.partition_customers(convex_sets)
         for depot in self.depots:
             convex_set = [[depot]] + [convex_sets[city] for city in self.groups[depot]]
             cities = self.groups[depot]

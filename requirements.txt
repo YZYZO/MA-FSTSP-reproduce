@@ -19,6 +19,7 @@ fonttools==4.42.1
 frozenlist==1.4.1
 fsspec==2023.12.2
 geopandas==0.14.2
+gurobipy==10.0.1
 
 hybrid==1.2.3
 idna==3.6

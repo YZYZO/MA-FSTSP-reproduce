@@ -18,6 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src.fstsp import InstanceTimeLimitExceeded
+from src.partition import calculate_set_tsp_model_size, normalize_candidate_sets
 from utils import ensure_dir
 
 
@@ -80,7 +82,12 @@ def _json_array(records):
     return np.asarray([_json_text(record) for record in records], dtype=np.str_)
 
 
-def _solve_model_with_process_data(model):
+def _solve_model_with_process_data(
+    model,
+    candidate_sets=None,
+    candidate_set_seconds=None,
+    instance_time_limit=None,
+):
     """
     按论文三阶段流程求解一个实例，并同步采集可复核的紧凑过程数据。
 
@@ -91,7 +98,7 @@ def _solve_model_with_process_data(model):
     - `(solution, cost, process_data)`：最终联合路线、目标值和三阶段记录。
 
     实现逻辑：
-    1. 分别计时边界集合构造和 MST 客户分组。
+    1. 分别计时候选边界集合构造和配置的客户分组方法。
     2. 对每个仓库记录 Set-TSP 顺序、访问顺序和求解耗时。
     3. 记录 Phase 3 的目标贡献、耗时及最终卡车/无人机路线。
 
@@ -102,14 +109,49 @@ def _solve_model_with_process_data(model):
     model.cost = 0
 
     # Phase 1a：构造客户候选区域的边界点集合。
-    start = time.perf_counter()
-    convex_sets = model.get_boundary_convex_sets(model.theta[0])
-    boundary_seconds = time.perf_counter() - start
+    if candidate_sets is None:
+        start = time.perf_counter()
+        raw_sets = model.get_boundary_convex_sets(model.theta[0])
+        boundary_seconds = time.perf_counter() - start
+    else:
+        # 配对运行器只计算一次候选集；各方法仍记录相同公共耗时以保持总耗时口径。
+        raw_sets = candidate_sets
+        boundary_seconds = float(candidate_set_seconds or 0.0)
+    # 第一阶段和第二阶段共用正规化集合，避免空边界造成 Set-TSP 空集合。
+    convex_sets = normalize_candidate_sets(model.cities, raw_sets)
 
-    # Phase 1b：根据集合距离构造 MST，并把客户分配给仓库。
+    # Phase 1b：按模型配置执行原 SMST 或 Directed Set-GTDS 客户划分。
     start = time.perf_counter()
-    model.set_mst(convex_sets)
-    partition_seconds = time.perf_counter() - start
+    model.partition_customers(convex_sets)
+    measured_partition_seconds = time.perf_counter() - start
+    partition_seconds = (
+        float(model.partition_result.phase1_time)
+        if model.precomputed_partition_result is not None
+        else measured_partition_seconds
+    )
+    partition_diagnostics = (
+        model.partition_result.diagnostics()
+        if model.partition_result is not None
+        else {}
+    )
+
+    def remaining_instance_seconds(current_record=None):
+        """返回实例逻辑剩余秒数；可计入尚未追加的当前仓库记录。"""
+
+        if instance_time_limit is None:
+            return None
+        consumed = (
+            boundary_seconds
+            + partition_seconds
+            + sum(record['set_tsp_seconds'] for record in depot_records)
+            + sum(record['local_search_seconds'] for record in depot_records)
+        )
+        if current_record is not None:
+            consumed += (
+                current_record['set_tsp_seconds']
+                + current_record['local_search_seconds']
+            )
+        return max(0.0, float(instance_time_limit) - consumed)
 
     # 边界集合只记录规模，不保存可能很大的完整节点列表。
     boundary_set_sizes = {
@@ -141,40 +183,205 @@ def _solve_model_with_process_data(model):
             'objective_contribution': 0.0,
             'set_tsp_seconds': 0.0,
             'local_search_seconds': 0.0,
+            'estimated_q_bin': 0,
+            'estimated_q_var': 0,
+            'estimated_q_con': 0,
+            'set_tsp_status': 'not_required',
+            'set_tsp_build_seconds': 0.0,
+            'set_tsp_optimize_seconds': 0.0,
+            'actual_num_bin_vars': 0,
+            'actual_num_vars': 0,
+            'actual_num_constraints': 0,
+            'gurobi_node_count': None,
+            'gurobi_mip_gap': None,
+            'gurobi_solution_count': 0,
+            'time_limit_reached': False,
+            'has_incumbent': True,
+            'set_tsp_error': None,
+            'set_tsp_objective': None,
+            'phase3_completed': len(group) == 0,
+            'phase3_skipped_reason': None,
+            'instance_time_limit_reached': False,
         }
 
         if len(group) == 0:
             raw_solution = {'truck': [depot, depot], 'drone': []}
         else:
+            remaining_seconds = remaining_instance_seconds(record)
+            if remaining_seconds is not None and remaining_seconds <= 0:
+                # 前序阶段已耗尽总预算；仍写入完整仓库记录，便于统计超时率。
+                record.update({
+                    'set_tsp_status': 'instance_time_limit',
+                    'time_limit_reached': True,
+                    'has_incumbent': False,
+                    'set_tsp_error': '实例级时间预算在 Phase 2 前已耗尽',
+                    'phase3_skipped_reason': 'instance_time_limit',
+                    'instance_time_limit_reached': True,
+                })
+                raw_solution = {'truck': [depot, depot], 'drone': []}
+                model.solution.append(model.convert(raw_solution))
+                depot_records.append(record)
+                continue
+
+            model_sizes = calculate_set_tsp_model_size(
+                [len(nodes) for nodes in local_convex_sets]
+            )
+            record['estimated_q_bin'] = model_sizes[0]
+            record['estimated_q_var'] = model_sizes[1]
+            record['estimated_q_con'] = model_sizes[2]
             # Phase 2：求集合 TSP 顺序，再转换为实际客户节点访问顺序。
             record['set_tsp_solver'] = 'LKH' if model.theta[1] == 0 else 'Set-TSP'
-            start = time.perf_counter()
-            sequence = model.get_seq(depot, local_convex_sets)
-            record['set_tsp_seconds'] = time.perf_counter() - start
+            phase2_time_limit = model.set_tsp_time_limit
+            if remaining_seconds is not None:
+                phase2_time_limit = (
+                    remaining_seconds
+                    if phase2_time_limit is None
+                    else min(float(phase2_time_limit), remaining_seconds)
+                )
+            if phase2_time_limit is None:
+                solve_result = model.get_seq_result(depot, local_convex_sets)
+            else:
+                solve_result = model.get_seq_result(
+                    depot,
+                    local_convex_sets,
+                    time_limit=phase2_time_limit,
+                )
+            sequence = solve_result.sequence
+            record.update({
+                'set_tsp_status': solve_result.status,
+                'set_tsp_build_seconds': solve_result.build_seconds,
+                'set_tsp_optimize_seconds': solve_result.optimize_seconds,
+                'set_tsp_seconds': (
+                    solve_result.build_seconds + solve_result.optimize_seconds
+                ),
+                'actual_num_bin_vars': solve_result.num_bin_vars,
+                'actual_num_vars': solve_result.num_vars,
+                'actual_num_constraints': solve_result.num_constraints,
+                'gurobi_node_count': solve_result.node_count,
+                'gurobi_mip_gap': solve_result.mip_gap,
+                'gurobi_solution_count': solve_result.solution_count,
+                'time_limit_reached': solve_result.time_limit_reached,
+                'has_incumbent': solve_result.has_incumbent,
+                'set_tsp_error': solve_result.error_message,
+                'set_tsp_objective': solve_result.objective,
+            })
+            if sequence is None:
+                # 无 incumbent 时不能进入 Phase 3；保留占位路线并继续处理其他仓库，
+                # 从而让整批实验能够计算失败率，而不是由单个实例终止。
+                record['phase3_skipped_reason'] = 'set_tsp_without_incumbent'
+                raw_solution = {'truck': [depot, depot], 'drone': []}
+                converted_solution = model.convert(raw_solution)
+                model.solution.append(converted_solution)
+                depot_records.append(record)
+                continue
             visit_route = [depot] + [group[index - 1] for index in sequence[1:-1]] + [depot]
             record['set_tsp_sequence'] = list(sequence)
             record['visit_route'] = visit_route
 
             # Phase 3：在固定访问顺序下运行 DP，并保留最终选中的联合路线。
             start = time.perf_counter()
-            raw_solution, contribution = model.local_search_multi_drone_appr(visit_route, depot)
+            remaining_seconds = remaining_instance_seconds(record)
+            if remaining_seconds is not None and remaining_seconds <= 0:
+                record.update({
+                    'phase3_skipped_reason': 'instance_time_limit',
+                    'instance_time_limit_reached': True,
+                })
+                raw_solution = {'truck': [depot, depot], 'drone': []}
+                model.solution.append(model.convert(raw_solution))
+                depot_records.append(record)
+                continue
+            phase3_deadline = (
+                None
+                if remaining_seconds is None
+                else time.perf_counter() + remaining_seconds
+            )
+            try:
+                if phase3_deadline is None:
+                    raw_solution, contribution = model.local_search_multi_drone_appr(
+                        visit_route,
+                        depot,
+                    )
+                else:
+                    raw_solution, contribution = model.local_search_multi_drone_appr(
+                        visit_route,
+                        depot,
+                        deadline=phase3_deadline,
+                    )
+            except InstanceTimeLimitExceeded:
+                record['local_search_seconds'] = time.perf_counter() - start
+                record.update({
+                    'phase3_skipped_reason': 'instance_time_limit',
+                    'instance_time_limit_reached': True,
+                })
+                raw_solution = {'truck': [depot, depot], 'drone': []}
+                model.solution.append(model.convert(raw_solution))
+                depot_records.append(record)
+                continue
             record['local_search_seconds'] = time.perf_counter() - start
             record['objective_contribution'] = float(contribution)
+            record['phase3_completed'] = True
             model.cost += contribution
 
         converted_solution = model.convert(raw_solution)
         model.solution.append(converted_solution)
         depot_records.append(record)
 
+    phase2_failed_depots = [
+        record['depot_index']
+        for record in depot_records
+        if record.get('customers') and not record.get('has_incumbent', False)
+    ]
+    phase3_failed_depots = [
+        record['depot_index']
+        for record in depot_records
+        if record.get('customers')
+        and record.get('has_incumbent', False)
+        and not record.get('phase3_completed', False)
+    ]
+    failed_depots = [
+        record['depot_index']
+        for record in depot_records
+        if record.get('customers') and (
+            not record.get('has_incumbent', False)
+            or not record.get('phase3_completed', False)
+        )
+    ]
+    instance_time_limit_reached = any(
+        record.get('instance_time_limit_reached', False)
+        for record in depot_records
+    )
+    logical_solve_seconds = (
+        boundary_seconds
+        + partition_seconds
+        + sum(record['set_tsp_seconds'] for record in depot_records)
+        + sum(record['local_search_seconds'] for record in depot_records)
+    )
     process_data = {
+        'partition_method': model.partition_method,
+        'partition_diagnostics': partition_diagnostics,
         'boundary_set_sizes': boundary_set_sizes,
         'groups': group_records,
         'depot_records': depot_records,
         'boundary_convex_sets_seconds': boundary_seconds,
+        'partition_seconds': partition_seconds,
+        # 保留旧键，避免已有绘图和结果读取代码失效。
         'mst_partition_seconds': partition_seconds,
-        'solve_seconds': time.perf_counter() - total_start,
+        'solve_seconds': logical_solve_seconds,
+        'wall_seconds': time.perf_counter() - total_start,
+        'instance_status': (
+            'timeout'
+            if instance_time_limit_reached
+            else ('incomplete' if failed_depots else 'complete')
+        ),
+        'instance_time_limit': instance_time_limit,
+        'instance_time_limit_reached': instance_time_limit_reached,
+        'failed_depot_indices': failed_depots,
+        'failed_depot_count': len(failed_depots),
+        'phase2_failure_count': len(phase2_failed_depots),
+        'phase3_failure_count': len(phase3_failed_depots),
     }
-    return model.solution, float(model.cost), process_data
+    final_cost = float('nan') if failed_depots else float(model.cost)
+    return model.solution, final_cost, process_data
 
 
 def _iter_solution_sorties(route):
@@ -373,8 +580,14 @@ def _build_representative_trace(
         'depots': list(depots),
         'customers': expected_customers,
         'phase1': {
+            'partition_method': process_data.get('partition_method', 'smst_original'),
+            'partition_diagnostics': process_data.get('partition_diagnostics', {}),
             'boundary_set_sizes': process_data['boundary_set_sizes'],
             'boundary_convex_sets_seconds': process_data['boundary_convex_sets_seconds'],
+            'partition_seconds': process_data.get(
+                'partition_seconds',
+                process_data['mst_partition_seconds'],
+            ),
             'mst_partition_seconds': process_data['mst_partition_seconds'],
             'partition_valid': phase1_partition_valid,
         },
@@ -421,12 +634,27 @@ def _build_stsp_result_arrays(
 
     # 规则二维数组无需解析 JSON 就能进行阶段耗时和成本统计。
     phase2_seconds = np.zeros((len(results), depot_count), dtype=float)
+    phase2_build_seconds = np.zeros((len(results), depot_count), dtype=float)
+    phase2_optimize_seconds = np.zeros((len(results), depot_count), dtype=float)
+    phase2_actual_bin_vars = np.zeros((len(results), depot_count), dtype=np.int64)
+    phase2_actual_vars = np.zeros((len(results), depot_count), dtype=np.int64)
+    phase2_actual_constraints = np.zeros((len(results), depot_count), dtype=np.int64)
+    phase2_node_count = np.full((len(results), depot_count), np.nan, dtype=float)
+    phase2_mip_gap = np.full((len(results), depot_count), np.nan, dtype=float)
+    phase2_objective = np.full((len(results), depot_count), np.nan, dtype=float)
+    phase2_solution_count = np.zeros((len(results), depot_count), dtype=np.int64)
+    phase2_time_limit = np.zeros((len(results), depot_count), dtype=bool)
+    phase2_has_incumbent = np.zeros((len(results), depot_count), dtype=bool)
+    phase2_status = np.full((len(results), depot_count), 'not_required', dtype='<U32')
     phase3_seconds = np.zeros((len(results), depot_count), dtype=float)
     phase_costs = np.zeros((len(results), depot_count), dtype=float)
     phase1_boundary_seconds = np.zeros(len(results), dtype=float)
     phase1_partition_seconds = np.zeros(len(results), dtype=float)
     phase1_groups = []
     phase2_orders = []
+    partition_methods = []
+    phase1_diagnostics = []
+    instance_statuses = []
 
     for instance_index, process_data in enumerate(processes):
         records = process_data['depot_records']
@@ -435,7 +663,13 @@ def _build_stsp_result_arrays(
                 f'实例 {instance_index} 的仓库过程记录数 {len(records)} 与预期 {depot_count} 不一致。'
             )
         phase1_boundary_seconds[instance_index] = process_data['boundary_convex_sets_seconds']
-        phase1_partition_seconds[instance_index] = process_data['mst_partition_seconds']
+        phase1_partition_seconds[instance_index] = process_data.get(
+            'partition_seconds',
+            process_data['mst_partition_seconds'],
+        )
+        partition_methods.append(process_data.get('partition_method', 'smst_original'))
+        phase1_diagnostics.append(process_data.get('partition_diagnostics', {}))
+        instance_statuses.append(process_data.get('instance_status', 'complete'))
         phase1_groups.append(process_data['groups'])
         phase2_orders.append([
             {
@@ -446,11 +680,65 @@ def _build_stsp_result_arrays(
                 'set_tsp_solver': record['set_tsp_solver'],
                 'set_tsp_sequence': record['set_tsp_sequence'],
                 'visit_route': record['visit_route'],
+                'estimated_q_bin': record.get('estimated_q_bin', 0),
+                'estimated_q_var': record.get('estimated_q_var', 0),
+                'estimated_q_con': record.get('estimated_q_con', 0),
+                'set_tsp_status': record.get('set_tsp_status', 'unknown'),
+                'set_tsp_build_seconds': record.get('set_tsp_build_seconds', 0.0),
+                'set_tsp_optimize_seconds': record.get('set_tsp_optimize_seconds', 0.0),
+                'actual_num_bin_vars': record.get('actual_num_bin_vars', 0),
+                'actual_num_vars': record.get('actual_num_vars', 0),
+                'actual_num_constraints': record.get('actual_num_constraints', 0),
+                'gurobi_node_count': record.get('gurobi_node_count'),
+                'gurobi_mip_gap': record.get('gurobi_mip_gap'),
+                'gurobi_solution_count': record.get('gurobi_solution_count', 0),
+                'time_limit_reached': record.get('time_limit_reached', False),
+                'has_incumbent': record.get('has_incumbent', False),
+                'set_tsp_error': record.get('set_tsp_error'),
+                'set_tsp_objective': record.get('set_tsp_objective'),
+                'phase3_completed': record.get('phase3_completed', False),
+                'phase3_skipped_reason': record.get('phase3_skipped_reason'),
+                'instance_time_limit_reached': record.get(
+                    'instance_time_limit_reached', False
+                ),
             }
             for record in records
         ])
         for depot_index, record in enumerate(records):
             phase2_seconds[instance_index, depot_index] = record['set_tsp_seconds']
+            phase2_build_seconds[instance_index, depot_index] = record.get(
+                'set_tsp_build_seconds', 0.0
+            )
+            phase2_optimize_seconds[instance_index, depot_index] = record.get(
+                'set_tsp_optimize_seconds', 0.0
+            )
+            phase2_actual_bin_vars[instance_index, depot_index] = record.get(
+                'actual_num_bin_vars', 0
+            )
+            phase2_actual_vars[instance_index, depot_index] = record.get(
+                'actual_num_vars', 0
+            )
+            phase2_actual_constraints[instance_index, depot_index] = record.get(
+                'actual_num_constraints', 0
+            )
+            if record.get('gurobi_node_count') is not None:
+                phase2_node_count[instance_index, depot_index] = record['gurobi_node_count']
+            if record.get('gurobi_mip_gap') is not None:
+                phase2_mip_gap[instance_index, depot_index] = record['gurobi_mip_gap']
+            if record.get('set_tsp_objective') is not None:
+                phase2_objective[instance_index, depot_index] = record['set_tsp_objective']
+            phase2_solution_count[instance_index, depot_index] = record.get(
+                'gurobi_solution_count', 0
+            )
+            phase2_time_limit[instance_index, depot_index] = record.get(
+                'time_limit_reached', False
+            )
+            phase2_has_incumbent[instance_index, depot_index] = record.get(
+                'has_incumbent', False
+            )
+            phase2_status[instance_index, depot_index] = record.get(
+                'set_tsp_status', 'unknown'
+            )
             phase3_seconds[instance_index, depot_index] = record['local_search_seconds']
             phase_costs[instance_index, depot_index] = record['objective_contribution']
 
@@ -470,7 +758,7 @@ def _build_stsp_result_arrays(
     ]
 
     result_arrays = {
-        'result_schema_version': np.asarray(2, dtype=np.int64),
+        'result_schema_version': np.asarray(4, dtype=np.int64),
         'instance_indices': np.arange(len(results), dtype=np.int64),
         'depots': np.asarray(depots),
         'cities': np.asarray(cities),
@@ -482,10 +770,25 @@ def _build_stsp_result_arrays(
         'stsp_time': elapsed,
         'solutions_json': _json_array(solutions),
         'phase1_groups_json': _json_array(phase1_groups),
+        'partition_methods': np.asarray(partition_methods, dtype=np.str_),
+        'instance_status': np.asarray(instance_statuses, dtype=np.str_),
+        'phase1_diagnostics_json': _json_array(phase1_diagnostics),
         'phase2_orders_json': _json_array(phase2_orders),
         'phase1_boundary_time': phase1_boundary_seconds,
         'phase1_partition_time': phase1_partition_seconds,
         'phase2_time': phase2_seconds,
+        'phase2_build_time': phase2_build_seconds,
+        'phase2_optimize_time': phase2_optimize_seconds,
+        'phase2_actual_num_bin_vars': phase2_actual_bin_vars,
+        'phase2_actual_num_vars': phase2_actual_vars,
+        'phase2_actual_num_constraints': phase2_actual_constraints,
+        'phase2_node_count': phase2_node_count,
+        'phase2_mip_gap': phase2_mip_gap,
+        'phase2_objective': phase2_objective,
+        'phase2_solution_count': phase2_solution_count,
+        'phase2_time_limit_reached': phase2_time_limit,
+        'phase2_has_incumbent': phase2_has_incumbent,
+        'phase2_status': phase2_status,
         'phase3_time': phase3_seconds,
         'phase_costs': phase_costs,
         'representative_roles': np.asarray(
@@ -636,6 +939,19 @@ def _load_large_road_saved_result(result_file, instance_index=None):
             saved['phase1_groups'] = _decode_saved_json(
                 data, 'phase1_groups_json', instance_index
             )
+            if 'partition_methods' in data.files:
+                saved['partition_method'] = str(
+                    np.asarray(data['partition_methods']).reshape(-1)[instance_index]
+                )
+            if 'instance_status' in data.files:
+                saved['instance_status'] = str(
+                    np.asarray(data['instance_status']).reshape(-1)[instance_index]
+                )
+            saved['phase1_diagnostics'] = _decode_saved_json(
+                data,
+                'phase1_diagnostics_json',
+                instance_index,
+            )
             saved['phase2_orders'] = _decode_saved_json(
                 data, 'phase2_orders_json', instance_index
             )
@@ -651,6 +967,24 @@ def _load_large_road_saved_result(result_file, instance_index=None):
                 np.asarray(data['phase1_partition_time']).reshape(-1)[instance_index]
             )
             saved['phase2_time'] = np.asarray(data['phase2_time'])[instance_index].tolist()
+            # Schema v4 遥测字段按存在性读取，继续兼容 v3 及更早结果。
+            phase2_optional_fields = (
+                'phase2_build_time',
+                'phase2_optimize_time',
+                'phase2_actual_num_bin_vars',
+                'phase2_actual_num_vars',
+                'phase2_actual_num_constraints',
+                'phase2_node_count',
+                'phase2_mip_gap',
+                'phase2_objective',
+                'phase2_solution_count',
+                'phase2_time_limit_reached',
+                'phase2_has_incumbent',
+                'phase2_status',
+            )
+            for field in phase2_optional_fields:
+                if field in data.files:
+                    saved[field] = np.asarray(data[field])[instance_index].tolist()
             saved['phase3_time'] = np.asarray(data['phase3_time'])[instance_index].tolist()
             saved['phase_costs'] = np.asarray(data['phase_costs'])[instance_index].tolist()
         return saved, len(costs)

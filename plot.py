@@ -74,7 +74,7 @@ ARTIFACTS = {
 # configuration.
 LARGE_ROAD_RESULT_ROOT = result_path()
 LARGE_ROAD_OUTPUT_ROOT = result_path()
-LARGE_ROAD_CITIES = ('manhattan', 'boston')
+LARGE_ROAD_CITIES = ('manhattan', 'nyc_proxy')
 LARGE_ROAD_CUSTOMER_COUNT = 100
 # 新格式结果默认展示目标函数最接近中位数的代表实例；传入整数仍可指定任意实例。
 LARGE_ROAD_INSTANCE_INDEX = None
@@ -108,10 +108,10 @@ LARGE_ROAD_CITY_CONFIGS = {
         'num_depots': 5,
         'drones_per_truck': 3,
     },
-    'boston': {
-        'label': 'Boston 11K (NYC substitute)',
-        'result_subdir': 'boston',
-        'result_map_name': 'boston_11k',
+    'nyc_proxy': {
+        'label': 'NYC 11K proxy',
+        'result_subdir': 'nyc_proxy',
+        'result_map_name': 'nyc_11k_proxy',
         'instance_builder': 'manhattan',
         'graph_loader': 'manhattan',
         'graph_path': MANHATTAN11k_GRAPH_PATH,
@@ -1603,7 +1603,7 @@ def plot_large_road_experiment_results(
     allow_legacy_11k_resolve=None,
 ):
     """
-    可视化 Manhattan 1K 与 Boston 11K 路网实验结果。
+    可视化 Manhattan 1K 与 NYC 11K proxy 路网实验结果。
 
     输入：结果/输出根目录、城市配置、客户规模、可选实例编号、绘图开关，以及
     是否允许旧版 11k 结果在绘图阶段重新求解。

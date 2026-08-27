@@ -241,6 +241,17 @@ def mst_partition(graph, depots, cities):
     3. 再通过第二次递归回溯每个客户应属于哪个仓库。
     """
     # 在输入图上构造最小生成树。
+    # 将仓库输入统一为普通列表和索引映射。原实现使用 ``np.where``，
+    # 对 Python list 做相等比较时无法得到逐元素布尔数组。
+    depot_order = list(depots)
+    if not depot_order:
+        raise ValueError('mst_partition 至少需要一个仓库。')
+    depot_set = set(depot_order)
+    depot_to_index = {
+        depot: depot_index
+        for depot_index, depot in enumerate(depot_order)
+    }
+
     tree = nx.minimum_spanning_tree(graph)
 
     # 初始化每个节点的父节点标记，`-1` 表示尚未设置。
@@ -281,7 +292,7 @@ def mst_partition(graph, depots, cities):
                 # 记录孩子的非连通代价。
                 tree.nodes[n]['ncon'] = ncon
                 # 如果孩子本身就是仓库，则其连通方式比较特殊。
-                if n in depots:
+                if n in depot_set:
                     # 记录当前孩子走父边连接时的总代价。
                     cons.append(con + tree[node][n]['weight'])
                     # 记录孩子不走父边时的代价。
@@ -307,7 +318,7 @@ def mst_partition(graph, depots, cities):
                     # 如果孩子子树内没有仓库，只能把该子树整体向上带走。
                     ncons.append(ncon + tree[node][n]['weight'])
         # 如果当前节点就是仓库，则它天然连通到自己。
-        if node in depots:
+        if node in depot_set:
             # 当前子树连通代价为所有孩子非连通代价之和。
             con = sum(ncons)
             # 仓库节点不需要定义“非连通”方案。
@@ -330,13 +341,13 @@ def mst_partition(graph, depots, cities):
         return con, ncon
 
     # 从第一个仓库开始做一次树形 DP。
-    con, ncon = rooted_tree(depots[0])
+    con, ncon = rooted_tree(depot_order[0])
     # 记录根仓库的连通代价。
-    tree.nodes[depots[0]]['con'] = con
+    tree.nodes[depot_order[0]]['con'] = con
     # 记录根仓库的非连通代价。
-    tree.nodes[depots[0]]['ncon'] = ncon
+    tree.nodes[depot_order[0]]['ncon'] = ncon
     # 根节点没有父边，因此不向上连通。
-    tree.nodes[depots[0]]['pcon'] = False
+    tree.nodes[depot_order[0]]['pcon'] = False
 
     def assign_group(node, value):
         """
@@ -354,16 +365,16 @@ def mst_partition(graph, depots, cities):
         2. 沿着最优通路继续递归，给所有节点写入 `group` 字段。
         """
         # 如果当前节点本身是仓库。
-        if node in depots:
+        if node in depot_set:
             # 将其分组编号设为它在 `depots` 中的位置。
-            tree.nodes[node]['group'] = np.where(depots == node)[0].item()
+            tree.nodes[node]['group'] = depot_to_index[node]
             # 遍历它的所有孩子。
             for n in tree.neighbors(node):
                 # 跳过父节点。
                 if n != tree.nodes[node]['parent']:
                     # 如果孩子也是仓库，则它自成一组。
-                    if n in depots:
-                        tree.nodes[n]['group'] = np.where(depots == n)[0].item()
+                    if n in depot_set:
+                        tree.nodes[n]['group'] = depot_to_index[n]
                         assign_group(n, tree.nodes[n]['con'])
                     # 如果孩子通过当前节点向上连接，则它继承当前仓库组。
                     elif tree.nodes[n]['pcon']:
@@ -378,8 +389,8 @@ def mst_partition(graph, depots, cities):
             # 找到最佳通路上的那个孩子。
             n = tree.nodes[node]['child']
             # 若该孩子本身就是仓库，则两者归入同组。
-            if n in depots:
-                index = np.where(depots == n)[0].item()
+            if n in depot_set:
+                index = depot_to_index[n]
                 tree.nodes[node]['group'] = index
                 tree.nodes[n]['group'] = index
                 assign_group(n, tree.nodes[n]['con'])
@@ -390,8 +401,8 @@ def mst_partition(graph, depots, cities):
             for n in tree.neighbors(node):
                 if n != tree.nodes[node]['parent'] and n != tree.nodes[node]['child']:
                     # 仓库孩子自成一组。
-                    if n in depots:
-                        tree.nodes[n]['group'] = np.where(depots == n)[0].item()
+                    if n in depot_set:
+                        tree.nodes[n]['group'] = depot_to_index[n]
                         assign_group(n, tree.nodes[n]['con'])
                     # 若孩子通过当前节点向上连接，则继承当前组。
                     elif tree.nodes[n]['pcon']:
@@ -407,8 +418,8 @@ def mst_partition(graph, depots, cities):
                 # 跳过父节点。
                 if n != tree.nodes[node]['parent']:
                     # 仓库孩子自成一组。
-                    if n in depots:
-                        tree.nodes[n]['group'] = np.where(depots == n)[0].item()
+                    if n in depot_set:
+                        tree.nodes[n]['group'] = depot_to_index[n]
                         assign_group(n, tree.nodes[n]['con'])
                     # 若孩子通过当前节点向上连接，则继承当前组。
                     elif tree.nodes[n]['pcon']:
@@ -421,15 +432,15 @@ def mst_partition(graph, depots, cities):
         return tree.nodes[node]['group']
 
     # 从第一个仓库开始回溯分组结果。
-    assign_group(depots[0], tree.nodes[depots[0]]['con'])
+    assign_group(depot_order[0], tree.nodes[depot_order[0]]['con'])
 
     # 初始化最终分组字典。
-    groups = {depot: [] for depot in depots}
+    groups = {depot: [] for depot in depot_order}
     # 遍历树中的所有节点。
     for node in tree.nodes:
         # 只把客户加入最终结果。
-        if node not in depots:
-            groups[depots[tree.nodes[node]['group']]].append(node)
+        if node not in depot_set:
+            groups[depot_order[tree.nodes[node]['group']]].append(node)
     # 返回仓库到客户列表的映射。
     return groups
 
