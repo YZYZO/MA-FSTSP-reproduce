@@ -75,6 +75,9 @@ pip install -r requirements.txt
 - `datasets/cambridge_all_pair_road_distance.pkl`
 
 ## 如何运行实验
+
+客户划分修复的阶段 A/B 实验使用独立脚本，运行顺序、指标与断点续跑见 [服务器运行指南](docs/partition_repair_server_guide.md)。
+
 ### 1. 选择并运行实验
 当前执行范围由 `experiments.py` 中的 `run_full_experiments()` 明确控制。确认其中启用的函数和规模后运行：
 

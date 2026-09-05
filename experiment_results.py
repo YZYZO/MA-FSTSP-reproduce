@@ -80,101 +80,15 @@ def _json_array(records):
     return np.asarray([_json_text(record) for record in records], dtype=np.str_)
 
 
-def _solve_model_with_process_data(model):
-    """
-    按论文三阶段流程求解一个实例，并同步采集可复核的紧凑过程数据。
+def _solve_model_with_process_data(model, *, partition=None, partition_strategy='original_mst',
+                                   solver_options=None, repair_options=None):
+    """?????????/??????????????????????????"""
+    from src.partition_repair.evaluator import solve_with_records
 
-    输入：
-    - model: 已构造的 `MultiAgentFlyingSidekickTSP` 模型。
-
-    输出：
-    - `(solution, cost, process_data)`：最终联合路线、目标值和三阶段记录。
-
-    实现逻辑：
-    1. 分别计时边界集合构造和 MST 客户分组。
-    2. 对每个仓库记录 Set-TSP 顺序、访问顺序和求解耗时。
-    3. 记录 Phase 3 的目标贡献、耗时及最终卡车/无人机路线。
-
-    这里只保存阶段输出与最终选中路径，不保留完整 DP 状态表，避免大实例结果膨胀。
-    """
-    total_start = time.perf_counter()
-    model.solution = []
-    model.cost = 0
-
-    # Phase 1a：构造客户候选区域的边界点集合。
-    start = time.perf_counter()
-    convex_sets = model.get_boundary_convex_sets(model.theta[0])
-    boundary_seconds = time.perf_counter() - start
-
-    # Phase 1b：根据集合距离构造 MST，并把客户分配给仓库。
-    start = time.perf_counter()
-    model.set_mst(convex_sets)
-    partition_seconds = time.perf_counter() - start
-
-    # 边界集合只记录规模，不保存可能很大的完整节点列表。
-    boundary_set_sizes = {
-        city: len(convex_sets[city])
-        for city in model.cities
-    }
-    group_records = [
-        {
-            'depot_index': depot_index,
-            'depot_node': depot,
-            'customers': list(model.groups[depot]),
-        }
-        for depot_index, depot in enumerate(model.depots)
-    ]
-
-    depot_records = []
-    for depot_index, depot in enumerate(model.depots):
-        # 当前仓库的客户及候选集合用于 Phase 2 和 Phase 3。
-        group = list(model.groups[depot])
-        local_convex_sets = [[depot]] + [convex_sets[city] for city in group]
-        record = {
-            'depot_index': depot_index,
-            'depot_node': depot,
-            'customers': group,
-            'convex_set_sizes': [len(nodes) for nodes in local_convex_sets],
-            'set_tsp_solver': 'none',
-            'set_tsp_sequence': [],
-            'visit_route': [depot, depot],
-            'objective_contribution': 0.0,
-            'set_tsp_seconds': 0.0,
-            'local_search_seconds': 0.0,
-        }
-
-        if len(group) == 0:
-            raw_solution = {'truck': [depot, depot], 'drone': []}
-        else:
-            # Phase 2：求集合 TSP 顺序，再转换为实际客户节点访问顺序。
-            record['set_tsp_solver'] = 'LKH' if model.theta[1] == 0 else 'Set-TSP'
-            start = time.perf_counter()
-            sequence = model.get_seq(depot, local_convex_sets)
-            record['set_tsp_seconds'] = time.perf_counter() - start
-            visit_route = [depot] + [group[index - 1] for index in sequence[1:-1]] + [depot]
-            record['set_tsp_sequence'] = list(sequence)
-            record['visit_route'] = visit_route
-
-            # Phase 3：在固定访问顺序下运行 DP，并保留最终选中的联合路线。
-            start = time.perf_counter()
-            raw_solution, contribution = model.local_search_multi_drone_appr(visit_route, depot)
-            record['local_search_seconds'] = time.perf_counter() - start
-            record['objective_contribution'] = float(contribution)
-            model.cost += contribution
-
-        converted_solution = model.convert(raw_solution)
-        model.solution.append(converted_solution)
-        depot_records.append(record)
-
-    process_data = {
-        'boundary_set_sizes': boundary_set_sizes,
-        'groups': group_records,
-        'depot_records': depot_records,
-        'boundary_convex_sets_seconds': boundary_seconds,
-        'mst_partition_seconds': partition_seconds,
-        'solve_seconds': time.perf_counter() - total_start,
-    }
-    return model.solution, float(model.cost), process_data
+    return solve_with_records(
+        model, partition=partition, partition_strategy=partition_strategy,
+        solver_options=solver_options, repair_options=repair_options,
+    )
 
 
 def _iter_solution_sorties(route):
@@ -488,6 +402,16 @@ def _build_stsp_result_arrays(
         'phase2_time': phase2_seconds,
         'phase3_time': phase3_seconds,
         'phase_costs': phase_costs,
+        # 完整组遥测和实例构造耗时独立保存，便于恢复预算、回退与详细时间分解。
+        'solver_telemetry_json': _json_array([p['depot_records'] for p in processes]),
+        'instance_initialization_time': np.asarray([
+            p.get('instance_initialization_seconds', 0.0) for p in processes
+        ], dtype=float),
+        'partition_metadata_json': _json_array([
+            {key: p.get(key) for key in ('partition_strategy', 'selected_candidate', 'solver_options',
+                                        'feature_seconds', 'repair_seconds', 'selection_seconds')}
+            for p in processes
+        ]),
         'representative_roles': np.asarray(
             [role for role, _ in representatives], dtype=np.str_
         ),

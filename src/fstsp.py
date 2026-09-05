@@ -12,6 +12,7 @@ import elkai
 import gurobipy as gp
 from gurobipy import GRB
 import math
+import time
 import networkx as nx
 import numpy as np
 from .baseline import Baseline
@@ -41,6 +42,8 @@ class MultiAgentFlyingSidekickTSP(Baseline):
     3. 预计算每个客户的可服务区域。
     """
     def __init__(self, graph, depots, cities, distance, drone, limit=1.5, speed=1.6, theta=(0.5, 0.5)):
+        """输入完整实例，初始化共享路网与服务区域，并记录实例构造耗时。"""
+        initialization_start = time.perf_counter()
         super().__init__(graph, depots, cities, distance, drone, limit, speed)
         self.groups = {depot: [] for depot in depots}
         self.solution = []
@@ -56,6 +59,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                                     self.distance['drone'][node][city] < self.limit / 2] 
                             for city in cities},
                         **{ depot: [depot] for depot in depots}}
+        self.initialization_seconds = time.perf_counter() - initialization_start
         #city：外层遍历所有客户节点（cities）作为键，内层条件遍历所有地图节点作为值，构成键值对
         #内层条件为无人机距离矩阵中 node 和 city 距离小于飞行距离上限的一半 的node
         #depot：遍历所有仓库，键和值相同
@@ -167,7 +171,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
             return route
 
     @staticmethod
-    def set_tsp(convex_sets, distance, convex_set_distance):
+    def set_tsp(convex_sets, distance, convex_set_distance, *, solver_options=None, return_info=False):
         """
         求解集合化 TSP 顺序问题。
 
@@ -175,63 +179,105 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         - convex_sets: 各客户或仓库对应的候选点集合。
         - distance: 不同集合间候选点两两距离。
         - convex_set_distance: 同一集合内部起点/终点切换代价。
+        - solver_options: 优化预算、线程、种子和间隙配置；默认使用共同的实验配置。
+        - return_info: 是否同时返回建模/优化/恢复计时和求解状态。
 
         输出：
-        - 一个访问顺序 `seq`。
+        - 默认返回访问顺序；return_info=True 时返回 `(seq, info)`，无可行解时 seq 为 None。
 
         实现逻辑：
         1. 建立集合层面的 TSP 顺序变量。
         2. 建立集合内部节点选择变量和集合间连接变量。
         3. 用 Gurobi 求解后恢复访问顺序。
         """
+        from .partition_repair.settings import SolverOptions
+
+        options = solver_options or SolverOptions()
+        build_start = time.perf_counter()
         n = len(convex_sets)
-        model = gp.Model('Set-TSP')
-        #日志输出设置
-        model.setParam("OutputFlag", 0)
-        # first write a tsp for the visiting order of convex sets using GG model
-        select = model.addMVar((n, n), vtype=GRB.BINARY)
-        model.addConstrs(select[u, u] == 0 for u in range(n))
-        model.addConstrs(np.ones((n,)) @ select[:, v] == 1 for v in range(n))
-        model.addConstrs(np.ones((n,)) @ select[u, :] == 1 for u in range(n))
-        flow = model.addMVar((n, n), vtype=GRB.CONTINUOUS)
-        model.addConstrs(flow[u, v] <= n * select[u, v] for u in range(n) for v in range(n))
-        model.addConstr(np.ones((n,)) @ flow[0, :] == n - 1)
-        model.addConstr(np.ones((n,)) @ flow[:, 0] == 0)
-        model.addConstrs(flow[u, u] == 0 for u in range(n))
-        model.addConstrs(np.ones((n,)) @ flow[:, v] - np.ones((n,)) @ flow[v, :] == 1 for v in range(1, n))
+        with gp.Model('Set-TSP') as model:
+            # 统一各候选的优化预算和资源设置，日志输出关闭。
+            model.setParam("OutputFlag", 0)
+            model.setParam("Threads", options.threads)
+            model.setParam("Seed", options.seed)
+            model.setParam("MIPGap", options.mip_gap)
+            if options.time_limit is not None:
+                model.setParam("TimeLimit", options.time_limit)
+            # select 表示集合访问边；flow 用单商品流约束消除不经过仓库的子环。
+            select = model.addMVar((n, n), vtype=GRB.BINARY)
+            model.addConstrs(select[u, u] == 0 for u in range(n))
+            model.addConstrs(np.ones((n,)) @ select[:, v] == 1 for v in range(n))
+            model.addConstrs(np.ones((n,)) @ select[u, :] == 1 for u in range(n))
+            flow = model.addMVar((n, n), vtype=GRB.CONTINUOUS)
+            model.addConstrs(flow[u, v] <= n * select[u, v] for u in range(n) for v in range(n))
+            model.addConstr(np.ones((n,)) @ flow[0, :] == n - 1)
+            model.addConstr(np.ones((n,)) @ flow[:, 0] == 0)
+            model.addConstrs(flow[u, u] == 0 for u in range(n))
+            model.addConstrs(np.ones((n,)) @ flow[:, v] - np.ones((n,)) @ flow[v, :] == 1 for v in range(1, n))
 
-        # internal is the selection of node pair inside each convex set
-        internal = [[[model.addVar(vtype=GRB.BINARY) for _ in convex_set] for _ in convex_set] for convex_set in
-                    convex_sets]
-        # external is the selection of node pair between two convex sets
-        external = [[[[model.addVar(vtype=GRB.BINARY) for _ in v] for _ in u] for v in convex_sets] for u in
-                    convex_sets]
-        model.addConstrs(gp.quicksum([internal[i][j][k] for j in range(len(convex_sets[i]))
-                                      for k in range(len(convex_sets[i]))]) == 1 for i in range(n))
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for i in range(len(convex_sets[u]))
-                                      for j in range(len(convex_sets[v]))]) == select[u, v]
-                         for u in range(n) for v in range(n))
-        # node j in convex sets v should have same out degree internal and in degree external
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for u in range(n) for i in range(len(convex_sets[u]))]) ==
-                         gp.quicksum([internal[v][j][k] for k in range(len(convex_sets[v]))]) for v in range(n)
-                         for j in range(len(convex_sets[v])))
-        # node i in convex sets u should have same in degree internal and out degree external
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for v in range(n) for j in range(len(convex_sets[v]))]) ==
-                         gp.quicksum([internal[u][k][i] for k in range(len(convex_sets[u]))]) for u in range(n)
-                         for i in range(len(convex_sets[u])))
-        model.setObjective(gp.quicksum([convex_set_distance[i][j][k] * internal[i][j][k] for i in range(n)
-                                        for j in range(len(convex_sets[i])) for k in range(len(convex_sets[i]))]) +
-                           gp.quicksum([distance[u][v][i][j] * external[u][v][i][j] for u in range(n) for v in range(n)
-                                        for i in range(len(convex_sets[u])) for j in range(len(convex_sets[v]))]),
-                           GRB.MINIMIZE)
-        model.optimize()
-
-        seq = [0]
-        while seq.count(0) < 2:
-            for j in range(n):
-                if select[seq[-1], j].X > 0.99:
-                    seq.append(j)
-                    break
+            # internal 表示每个集合内部的进出节点对。
+            internal = [[[model.addVar(vtype=GRB.BINARY) for _ in convex_set] for _ in convex_set] for convex_set in
+                        convex_sets]
+            # external 表示不同集合之间的有向节点连接。
+            external = [[[[model.addVar(vtype=GRB.BINARY) for _ in v] for _ in u] for v in convex_sets] for u in
+                        convex_sets]
+            model.addConstrs(gp.quicksum([internal[i][j][k] for j in range(len(convex_sets[i]))
+                                          for k in range(len(convex_sets[i]))]) == 1 for i in range(n))
+            model.addConstrs(gp.quicksum([external[u][v][i][j] for i in range(len(convex_sets[u]))
+                                          for j in range(len(convex_sets[v]))]) == select[u, v]
+                             for u in range(n) for v in range(n))
+            # 集合入口的外部入度与内部出度保持一致。
+            model.addConstrs(gp.quicksum([external[u][v][i][j] for u in range(n) for i in range(len(convex_sets[u]))]) ==
+                             gp.quicksum([internal[v][j][k] for k in range(len(convex_sets[v]))]) for v in range(n)
+                             for j in range(len(convex_sets[v])))
+            # 集合出口的内部入度与外部出度保持一致。
+            model.addConstrs(gp.quicksum([external[u][v][i][j] for v in range(n) for j in range(len(convex_sets[v]))]) ==
+                             gp.quicksum([internal[u][k][i] for k in range(len(convex_sets[u]))]) for u in range(n)
+                             for i in range(len(convex_sets[u])))
+            model.setObjective(gp.quicksum([convex_set_distance[i][j][k] * internal[i][j][k] for i in range(n)
+                                            for j in range(len(convex_sets[i])) for k in range(len(convex_sets[i]))]) +
+                               gp.quicksum([distance[u][v][i][j] * external[u][v][i][j] for u in range(n) for v in range(n)
+                                            for i in range(len(convex_sets[u])) for j in range(len(convex_sets[v]))]),
+                               GRB.MINIMIZE)
+            # 先提交延迟更新，将 Python 建模与优化调用的时间分开。
+            model.update()
+            info = {
+                'phase2_build_seconds': time.perf_counter() - build_start,
+                'num_vars': model.NumVars,
+                'num_binary': model.NumBinVars,
+                'num_constrs': model.NumConstrs,
+            }
+            optimize_start = time.perf_counter()
+            model.optimize()
+            info['phase2_optimize_seconds'] = time.perf_counter() - optimize_start
+            extract_start = time.perf_counter()
+            has_incumbent = model.SolCount > 0
+            gap = float(model.MIPGap) if has_incumbent else None
+            info.update({
+                'status': int(model.Status),
+                'has_incumbent': has_incumbent,
+                'solution_count': int(model.SolCount),
+                'timeout': model.Status == GRB.TIME_LIMIT,
+                'gap': gap if gap is not None and math.isfinite(gap) else None,
+                'gap_is_finite': gap is not None and math.isfinite(gap),
+                'set_tsp_objective': float(model.ObjVal) if has_incumbent else None,
+                'work': float(model.Work),
+                'solver_runtime_seconds': float(model.Runtime),
+            })
+            seq = None
+            if has_incumbent:
+                # 仅在存在可行解时读取 X，并限制恢复步数，避免不完整环导致死循环。
+                successors = np.argmax(select.X, axis=1)
+                seq = [0]
+                for _ in range(n):
+                    seq.append(int(successors[seq[-1]]))
+                if seq[-1] != 0 or sorted(seq[:-1]) != list(range(n)):
+                    raise RuntimeError('Set-TSP 可行解未恢复为完整客户环。')
+            info['phase2_extract_seconds'] = time.perf_counter() - extract_start
+        if return_info:
+            return seq, info
+        if seq is None:
+            raise RuntimeError('Set-TSP 没有可行解；请通过 get_seq 使用统一回退。')
         return seq
 
     def local_search_multi_drone_appr(self, seq, depot):
@@ -343,32 +389,76 @@ class MultiAgentFlyingSidekickTSP(Baseline):
 
         return prefix[2 * len(seq) - 3][depot], value[2 * len(seq) - 3][depot]
 
-    def get_seq(self, depot, convex_sets):
+    def get_seq(self, depot, convex_sets, *, cities=None, solver_options=None, return_info=False):
         """
         获取当前仓库组的客户访问顺序。
 
         输入：
         - depot: 当前仓库。
         - convex_sets: 当前仓库组的候选点集合列表。
+        - cities: 可显式传入客户组，避免依赖或修改模型中的当前分区。
+        - solver_options: 所有分区共用的求解配置。
+        - return_info: 是否返回距离准备、求解、回退的计时与状态。
 
         输出：
-        - 客户顺序索引序列。
+        - 客户顺序索引序列，或 `(序列, 计时与状态字典)`。
 
         实现逻辑：
         - 若关闭集合 TSP，则调用 `lkh`；
           否则构造集合化距离并调用 `set_tsp`。
         """
-        if self.theta[1] == 0:
-            seq = self.lkh(depot, self.groups[depot])
+        # 显式客户参数使固定分区评价无需修改 self.groups。
+        cities = list(self.groups[depot] if cities is None else cities)
+        info = {
+            'phase2_distance_seconds': 0.0, 'phase2_build_seconds': 0.0,
+            'phase2_optimize_seconds': 0.0, 'phase2_extract_seconds': 0.0,
+            'phase2_fallback_seconds': 0.0, 'fallback_used': False,
+            'status': 'EMPTY', 'has_incumbent': False, 'solution_count': 0,
+            'timeout': False, 'gap': None, 'gap_is_finite': False, 'set_tsp_objective': None,
+            'num_vars': 0, 'num_binary': 0, 'num_constrs': 0, 'work': 0.0,
+            'solver_runtime_seconds': 0.0, 'set_tsp_solver': 'none',
+        }
+        if not cities:
+            seq = [0, 0]
+        elif self.theta[1] == 0:
+            start = time.perf_counter()
+            seq = self.lkh(depot, cities)
+            info.update(status='LKH', set_tsp_solver='LKH')
+            info['phase2_optimize_seconds'] = time.perf_counter() - start
+        elif any(not nodes for nodes in convex_sets):
+            seq = None
+            info.update(status='EMPTY_BOUNDARY', set_tsp_solver='Set-TSP')
         else:
+            start = time.perf_counter()
             set_distance = [[[max(self.distance['truck'][k][j],
                                   self.cut_off((self.distance['drone'][j][city] + self.distance['drone'][city][k]),
                                                self.limit)) / self.speed for j in convex_set] for k in convex_set]
-                            for convex_set, city in zip(convex_sets, [depot] + self.groups[depot])]
+                            for convex_set, city in zip(convex_sets, [depot] + cities)]
             distance = [[[[self.distance['truck'][i][j] for j in v] for i in u]
                          for v in convex_sets] for u in convex_sets]
-            seq = self.set_tsp(convex_sets, distance, set_distance)
-        return seq
+            info['phase2_distance_seconds'] = time.perf_counter() - start
+            seq, solver_info = self.set_tsp(
+                convex_sets, distance, set_distance,
+                solver_options=solver_options, return_info=True,
+            )
+            info.update(solver_info, set_tsp_solver='Set-TSP')
+        if seq is None:
+            start = time.perf_counter()
+            seq = self.nearest_neighbor_sequence(depot, cities)
+            info.update(fallback_used=True, fallback_method='directed_nearest_neighbor')
+            info['phase2_fallback_seconds'] = time.perf_counter() - start
+        return (seq, info) if return_info else seq
+
+    def nearest_neighbor_sequence(self, depot, cities):
+        """输入仓库和客户，按有向卡车距离贪心生成闭环索引；距离相同时按索引确定顺序。"""
+        nodes = [depot] + list(cities)
+        remaining = set(range(1, len(nodes)))
+        sequence = [0]
+        while remaining:
+            chosen = min(remaining, key=lambda i: (self.distance['truck'][nodes[sequence[-1]]][nodes[i]], i))
+            remaining.remove(chosen)
+            sequence.append(chosen)
+        return sequence + [0]
 
     def single_solution(self, depot, convex_sets):
         """
@@ -466,12 +556,14 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                         break
         return boundary_convex_sets
 
-    def solve(self):
+    def solve(self, *, partition=None, partition_strategy='original_mst', solver_options=None, repair_options=None):
         """
         执行论文主算法的完整求解流程。
 
         输入：
-        - 无显式输入。
+        - partition: 可选完整分区；传入时直接评价该分区。
+        - partition_strategy: 分区方法名称，默认 original_mst。
+        - solver_options、repair_options: 求解配置与候选生成配置。
 
         输出：
         - `(self.solution, self.cost)`。
@@ -482,19 +574,13 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         3. 对每个仓库单独求解联合路线。
         4. 汇总所有仓库的结果。
         """
-        #获取客户服务范围（集合）内的边界点，加速计算
-        convex_sets = self.get_boundary_convex_sets(self.theta[0])
-        #用mst算法为仓库分配对应的客户
-        self.set_mst(convex_sets)
-        #对每个仓库（每个客户分组） 
-        for depot in self.depots:     
-            #创建当前仓库及其对应客户的点集合 的集合convex_set
-            convex_set = [[depot]] + [convex_sets[city] for city in self.groups[depot]]
-            #对当前仓库求解
-            solution = self.single_solution(depot, convex_set) 
-            #将解统一格式后返回
-            self.solution.append(self.convert(solution)) 
-        return self.solution, self.cost
+        from .partition_repair.evaluator import solve_with_records
+
+        solution, cost, _ = solve_with_records(
+            self, partition=partition, partition_strategy=partition_strategy,
+            solver_options=solver_options, repair_options=repair_options,
+        )
+        return solution, cost
 
     # function that helps fast generate the results for the ablation study of the drone numbers
     def solve_multiple_drones(self):
