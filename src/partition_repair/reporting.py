@@ -9,12 +9,14 @@ from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import lil_matrix
 
 from .storage import read_json, save_json
+from .settings import EvaluationOptions
 
 
-def aggregate_pairs(pairs, bootstrap=1000, seed=0):
+def aggregate_pairs(pairs, bootstrap=1000, seed=0, options=None):
     """输入完整实例的配对结果，按总量之比汇总；分层重采样以实例为单位，返回统计字典。"""
+    options = options or EvaluationOptions()
     if not pairs:
-        return {'instance_count': 0, 'passes_point_thresholds': False}
+        return {'instance_count': 0, 'passes_point_thresholds': False, 'thresholds': options.to_dict()}
     base_cost = np.array([p['baseline_cost'] for p in pairs], dtype=float)
     cost = np.array([p['cost'] for p in pairs], dtype=float)
     base_time = np.array([p['baseline_time'] for p in pairs], dtype=float)
@@ -31,12 +33,15 @@ def aggregate_pairs(pairs, bootstrap=1000, seed=0):
         'median_instance_cost_change': float(np.median(cost_changes)),
         'p90_instance_cost_change': float(np.quantile(cost_changes, .9)),
         'cost_over_5_percent_count': int(np.sum(cost_changes > .05 + 1e-12)),
+        'cost_over_limit_count': int(np.sum(cost_changes > options.cost_limit + 1e-12)),
+        'cost_over_limit_fraction': float(np.mean(cost_changes > options.cost_limit + 1e-12)),
+        'thresholds': options.to_dict(),
         'worst_cost_change': float(max(cost_changes)),
         'mean_instance_time_change': float(np.mean(time_changes)),
         'median_instance_time_change': float(np.median(time_changes)),
         'slower_instance_count': int(np.sum(time_changes > 0)),
         'worst_time_change': float(max(time_changes)),
-        'passes_point_thresholds': cost_ratio <= .05 + 1e-12 and saving >= .2 - 1e-12,
+        'passes_point_thresholds': cost_ratio <= options.cost_limit + 1e-12 and saving >= options.min_phase2_saving - 1e-12,
     }
     if all('online_seconds' in p for p in pairs):
         total_online = sum(p['online_seconds'] for p in pairs)
@@ -58,7 +63,8 @@ def aggregate_pairs(pairs, bootstrap=1000, seed=0):
         intervals = np.quantile(samples, [.025, .975], axis=0)
         result['cost_change_ci95'] = list(map(float, intervals[:, 0]))
         result['phase2_saving_ci95'] = list(map(float, intervals[:, 1]))
-        result['thresholds_supported_by_ci95'] = bool(intervals[1, 0] <= .05 and intervals[0, 1] >= .2)
+        result['thresholds_supported_by_ci95'] = bool(intervals[1, 0] <= options.cost_limit + 1e-12 and
+                                                     intervals[0, 1] >= options.min_phase2_saving - 1e-12)
     return result
 
 
@@ -132,10 +138,11 @@ def load_table(directory, name):
     return read_json(path) if path.exists() else []
 
 
-def candidate_report(directory, output, bootstrap=1000):
+def candidate_report(directory, output, bootstrap=1000, options=None):
     """分析阶段 A/B 候选表，输出潜力曲线、瓶颈、逐实例附表和未完成清单。"""
     directory, output = Path(directory), Path(output)
     manifest = read_json(directory / 'manifest.json')
+    options = options or EvaluationOptions(**manifest['configuration'].get('evaluation', {}))
     instance_rows = {row['id']: row for row in load_table(directory, 'instances')}
     candidates = load_table(directory, 'partition_candidates')
     expected = [row['id'] for row in manifest['instances']]
@@ -148,24 +155,24 @@ def candidate_report(directory, output, bootstrap=1000):
               'complete_instances': len(grouped), 'incomplete_instances': incomplete,
               'complete': not incomplete, 'timing_kind': 'offline_group_observations',
               'not_an_online_speed_measurement': True, 'potential': {}, 'by_size': {},
-              'scope': 'fixed_candidate_set_with_known_true_answers'}
+              'scope': 'fixed_candidate_set_with_known_true_answers', 'thresholds': options.to_dict()}
     chosen_rows = []
-    for epsilon in (0.0, .01, .03, .05):
+    for epsilon in sorted({0.0, .01, .03, .05, .075, options.cost_limit}):
         pairs = oracle_select(grouped, epsilon)
-        stats = aggregate_pairs(pairs, bootstrap)
+        stats = aggregate_pairs(pairs, bootstrap, options=options)
         stats['eligible_for_stage_gate'] = not incomplete and bool(grouped)
         stats['passes_point_thresholds'] = not incomplete and stats['passes_point_thresholds']
         # 区间仅描述固定事后选择的样本波动，不是可部署算法的泛化区间。
         stats['ci_scope'] = 'fixed_hindsight_choices_only'
         stats['thresholds_supported_by_ci95'] = not incomplete and stats.get('thresholds_supported_by_ci95', False)
         report['potential'][str(epsilon)] = stats
-        if epsilon == .05:
+        if epsilon == options.cost_limit:
             chosen_rows = pairs
-            report['per_instance_5_percent_oracle'] = aggregate_pairs(oracle_select(grouped, epsilon, True), bootstrap)
+            report['per_instance_limit_oracle'] = aggregate_pairs(oracle_select(grouped, epsilon, True), bootstrap, options=options)
     sizes = sorted({row['size'] for row in manifest['instances']})
     for size in sizes:
         subset = {key: rows for key, rows in grouped.items() if rows[0]['size'] == size}
-        report['by_size'][str(size)] = aggregate_pairs(oracle_select(subset, .05), bootstrap)
+        report['by_size'][str(size)] = aggregate_pairs(oracle_select(subset, options.cost_limit), bootstrap, options=options)
     group_runs = [r for r in load_table(directory, 'group_runs') if r.get('complete')]
     components = ['input', 'distance', 'build', 'optimize', 'extract', 'fallback', 'other']
     report['measured_group_phase2_components_seconds'] = {
@@ -188,15 +195,16 @@ def candidate_report(directory, output, bootstrap=1000):
         base = next(row for row in rows if row['name'] == 'stay')
         curve_rows += [dict(pair_row(base, row), kind=row['kind']) for row in rows]
     write_csv(output / 'candidate_curve.csv', curve_rows)
-    write_candidate_plot(output / 'candidate_curve.png', curve_rows)
+    write_candidate_plot(output / 'candidate_curve.png', curve_rows, options)
     write_report_markdown(output / 'candidate_report.md', report)
     return report
 
 
-def write_candidate_plot(path, rows):
+def write_candidate_plot(path, rows, options=None):
     """输入候选配对行，生成可导出的成本—第二阶段耗时散点图，使用无界面的绘图后端。"""
     if not rows:
         return
+    options = options or EvaluationOptions()
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -206,8 +214,8 @@ def write_candidate_plot(path, rows):
         values = [row for row in rows if row['kind'] == kind]
         ax.scatter([100 * row['cost_change'] for row in values],
                    [-100 * row['time_change'] for row in values], label=kind, alpha=.6, s=22)
-    ax.axvline(5, color='gray', linestyle='--', linewidth=1)
-    ax.axhline(20, color='gray', linestyle='--', linewidth=1)
+    ax.axvline(100 * options.cost_limit, color='gray', linestyle='--', linewidth=1)
+    ax.axhline(100 * options.min_phase2_saving, color='gray', linestyle='--', linewidth=1)
     ax.set(xlabel='Final delivery cost change (%)', ylabel='Complete Phase 2 time saving (%)',
            title='Development candidates: recorded downstream observations')
     ax.legend()
@@ -216,10 +224,11 @@ def write_candidate_plot(path, rows):
     plt.close(fig)
 
 
-def evaluation_report(directory, output, bootstrap=1000):
+def evaluation_report(directory, output, bootstrap=1000, options=None):
     """分析独立复测表，先按实例平均重复运行，再计算方法比较；不把重复作为新增实例。"""
     directory, output = Path(directory), Path(output)
     config = read_json(directory / 'evaluation_config.json')['configuration']
+    options = options or EvaluationOptions(**config.get('evaluation', {}))
     rows = load_table(directory, 'evaluation_runs')
     expected = config['expected_instances']
     grouped = defaultdict(list)
@@ -233,7 +242,8 @@ def evaluation_report(directory, output, bootstrap=1000):
         if len(observations) != config['repeats']:
             continue
         reduced[key] = dict(observations[0], **{field: float(np.mean([r[field] for r in observations])) for field in fields})
-    report = {'kind': 'fresh_development_evaluation', 'repeats_per_instance': config['repeats'],
+    report = {'kind': 'fresh_test_evaluation' if config.get('split') == 'test' else 'fresh_development_evaluation',
+              'thresholds': options.to_dict(), 'repeats_per_instance': config['repeats'],
               'expected_instances': len(expected), 'methods': {},
               'repeat_aggregation': 'arithmetic_mean_within_complete_instance'}
     preparation = read_json(directory / 'map_preparation.json') if (directory / 'map_preparation.json').exists() else {}
@@ -243,11 +253,11 @@ def evaluation_report(directory, output, bootstrap=1000):
         missing = [key for key in expected if (key, method) not in reduced or (key, 'symmetric_mst') not in reduced]
         pairs = [dict(pair_row(reduced[key, 'symmetric_mst'], reduced[key, method]), method=method)
                  for key in expected if key not in missing]
-        stats = aggregate_pairs(pairs, bootstrap)
+        stats = aggregate_pairs(pairs, bootstrap, options=options)
         stats.update(complete=not missing, incomplete_instances=missing)
         stats['passes_point_thresholds'] = not missing and stats['passes_point_thresholds']
         stats['thresholds_supported_by_ci95'] = not missing and stats.get('thresholds_supported_by_ci95', False)
-        stats['by_size'] = {str(size): aggregate_pairs([p for p in pairs if p['size'] == size], bootstrap)
+        stats['by_size'] = {str(size): aggregate_pairs([p for p in pairs if p['size'] == size], bootstrap, options=options)
                             for size in sorted({p['size'] for p in pairs})}
         stats['timeout_group_observations'] = sum(r.get('timeout_groups', 0) for r in rows if r.get('complete') and r['method'] == method)
         stats['fallback_group_observations'] = sum(r.get('fallback_groups', 0) for r in rows if r.get('complete') and r['method'] == method)
@@ -258,7 +268,9 @@ def evaluation_report(directory, output, bootstrap=1000):
                           'mst_partition_seconds', 'feature_seconds', 'repair_seconds', 'selection_seconds')
         }
         if pairs:
-            stats['cold_batch_seconds'] = stats['total_online_seconds'] + preparation.get('preparation_seconds', 0.0)
+            stats['model_load_seconds'] = preparation.get('model_load_seconds', {}).get(method, 0.0)
+            stats['cold_batch_seconds'] = (stats['total_online_seconds'] + preparation.get('preparation_seconds', 0.0)
+                                           + stats['model_load_seconds'])
             stats['baseline_cold_batch_seconds'] = stats['baseline_total_online_seconds'] + preparation.get('preparation_seconds', 0.0)
         report['methods'][method] = stats
         all_pairs.extend(pairs)
@@ -272,25 +284,29 @@ def evaluation_report(directory, output, bootstrap=1000):
 def write_report_markdown(path, report):
     """输入候选或实测报告，输出直接可阅读的结果摘要与缺失情况。"""
     lines = ['# MA-FSTSP 客户划分实验报告', '']
+    options = EvaluationOptions(**report.get('thresholds', {}))
     if report['kind'] == 'development_candidate_potential':
         lines += [f'完成实例：{report["complete_instances"]}/{report["expected_instances"]}。', '',
                   '以下为已知候选真实结果后的事后选择，使用离线组观测；不代表在线加速。', '',
                   '| 总体成本预算 | 成本变化 | 第二阶段节时 |', '|---|---:|---:|']
         for epsilon, stats in report['potential'].items():
             if stats['instance_count']:
-                lines.append(f'| {float(epsilon):.0%} | {stats["cost_change"]:+.2%} | {stats["phase2_saving"]:.2%} |')
+                lines.append(f'| {100 * float(epsilon):g}% | {stats["cost_change"]:+.2%} | {stats["phase2_saving"]:.2%} |')
         lines += ['', f'未完成实例：{", ".join(report["incomplete_instances"]) or "无"}。', '',
-                  '5% 是总体成本预算；逐实例恶化见 oracle_per_instance.csv。',
+                  f'{options.cost_limit:.0%} 是主总体成本预算；逐实例恶化见 oracle_per_instance.csv。',
                   '候选潜力接近或超过 30% 可为学习误差留出余量；进入学习前应查看独立复测中的手工选择表现。']
     else:
         lines += ['每个方法均独立求解；重复运行先在完整实例内取均值。', '',
-                  '| 方法 | 完成数 | 成本变化 | 第二阶段节时 | 端到端节时 |', '|---|---:|---:|---:|---:|']
+                  '| 方法 | 完成数 | 成本变化 | 第二阶段节时 | 端到端节时 | 成本超限比例 | 最坏成本增加 |',
+                  '|---|---:|---:|---:|---:|---:|---:|']
         for method, stats in report['methods'].items():
             if stats['instance_count']:
                 lines.append(f'| {method} | {stats["instance_count"]}/{report["expected_instances"]} | '
-                             f'{stats["cost_change"]:+.2%} | {stats["phase2_saving"]:.2%} | {stats["online_saving"]:.2%} |')
+                             f'{stats["cost_change"]:+.2%} | {stats["phase2_saving"]:.2%} | {stats["online_saving"]:.2%} | '
+                             f'{stats["cost_over_limit_fraction"]:.1%} | {stats["worst_cost_change"]:+.2%} |')
             else:
-                lines.append(f'| {method} | 0/{report["expected_instances"]} | — | — | — |')
-        lines += ['', '未完成实例会阻止通过判定。总体成本增加 ≤5%、第二阶段节时 ≥20% 是点估计门槛；',
+                lines.append(f'| {method} | 0/{report["expected_instances"]} | — | — | — | — | — |')
+        lines += ['', f'未完成实例会阻止通过判定。总体成本增加 ≤{options.cost_limit:.0%}、'
+                      f'第二阶段节时 ≥{options.min_phase2_saving:.0%} 是点估计门槛；',
                   '配对区间、逐规模统计和逐实例退化见 JSON 与 CSV。开发集表现不能替代独立测试验收。']
     Path(path).write_text('\n'.join(lines) + '\n', encoding='utf-8')

@@ -13,8 +13,8 @@ from src.fstsp import MultiAgentFlyingSidekickTSP
 from .candidates import Candidate, generate_candidates, symmetric_mst
 from .evaluator import evaluate_group, evaluate_partition, fixed_boundary, solve_with_records
 from .features import FeatureContext
-from .selector import METHODS, select_candidate
-from .settings import RepairOptions, SolverOptions
+from .selector import BASE_METHODS, METHODS, POLICY_METHODS
+from .settings import RepairOptions, SolverOptions, SelectionOptions, EvaluationOptions
 from .storage import (RecordTable, context_fingerprint, file_fingerprint, fingerprint,
                       group_cache_key, read_json, runtime_metadata, save_json)
 
@@ -27,9 +27,14 @@ def build_parser(mode):
     parser.add_argument('--limit-instances', type=int, help='只执行清单前若干实例；去掉此参数可继续完整清单')
     if mode == 'evaluate':
         parser.add_argument('--manifest', type=Path, required=True, help='已采集目录中的 manifest.json；继承其求解与修复设置')
-        parser.add_argument('--methods', choices=METHODS, nargs='+', default=list(METHODS))
+        parser.add_argument('--methods', choices=METHODS, nargs='+')
         parser.add_argument('--repeats', type=int, default=1)
+        parser.add_argument('--policy', type=Path, help='训练输出的 policy.json；模型相对该文件加载')
+        parser.add_argument('--selection-seed', type=int, default=0, help='无策略文件时的选择种子，与求解器独立')
+        parser.add_argument('--cost-limit', type=float, default=None)
+        parser.add_argument('--min-phase2-saving', type=float, default=None)
         return parser
+    parser.add_argument('--manifest', type=Path, help='准备脚本产生的训练或验证清单，继承其完整配置')
     parser.add_argument('--stage', choices=('A', 'B'), default='B')
     parser.add_argument('--sizes', type=int, nargs='+', default=[50, 100, 150])
     parser.add_argument('--instances-per-size', type=int)
@@ -84,6 +89,8 @@ def ensure_configuration(path, payload):
         old = read_json(path)
         if fingerprint(old['configuration']) != fingerprint(payload['configuration']):
             raise ValueError(f'{path} 的配置与本次不同，请使用新的 --output 目录。')
+        if 'instances' in payload and fingerprint(old['instances']) != fingerprint(payload['instances']):
+            raise ValueError('同一采集目录不能替换实例清单。')
         return old
     save_json(path, payload)
     return payload
@@ -95,6 +102,56 @@ def export_tables(tables):
         table.export()
 
 
+def verify_manifest_runtime(manifest, runtime, graph_id):
+    """输入当前运行环境和实验清单，核对地图与源码/求解语义，防止跨配置续跑。"""
+    config = manifest['configuration']
+    if graph_id != config['graph_fingerprint']:
+        raise ValueError('路网与实例清单不一致。')
+    for key in ('source_fingerprint', 'packages', 'distance_semantics', 'phase2_semantics', 'fallback'):
+        if runtime[key] != config['runtime'][key]:
+            raise ValueError(f'当前 {key} 与清单不一致；请使用准备脚本派生当前策略清单和新的输出目录。')
+
+
+def load_frozen_policies(path, methods, manifest, seed=0):
+    """输入策略文件与当前清单，加载所需模型、核对测试隔离，返回配置、模型和冷加载耗时。"""
+    configurations = {method: SelectionOptions(seed=seed) for method in methods}
+    models, load_seconds = {}, {}
+    if path is None:
+        if any(method in POLICY_METHODS for method in methods):
+            raise ValueError('校准或学习方法需要 --policy 指定冻结策略。')
+        return configurations, models, load_seconds, None
+    from .learning_dataset import instance_family, label_contract
+
+    path = Path(path)
+    bundle = read_json(path)
+    if bundle['contract'] != label_contract(manifest['configuration']):
+        raise ValueError('策略的候选、求解配置或计时环境与当前实验不一致。')
+    families = {instance_family(i, manifest['configuration']) for i in manifest['instances']}
+    split = manifest['configuration'].get('split', 'development')
+    forbidden = set(bundle['training_families'])
+    if split == 'test':
+        forbidden.update(bundle['calibration_families'])
+    if split in ('validation', 'test') and families & forbidden:
+        raise ValueError('验证/测试实例与策略训练或测试前校准身份重叠。')
+    for method in methods:
+        specification = bundle['methods'].get(method)
+        if specification is None:
+            if method in POLICY_METHODS:
+                raise ValueError(f'冻结策略缺少 {method}。')
+            continue
+        configurations[method] = SelectionOptions(**specification['options'])
+        if 'model_file' in specification:
+            start = time.perf_counter()
+            from .learning_model import DeltaModel
+
+            model_path = path.parent / specification['model_file']
+            if file_fingerprint(model_path) != specification['model_fingerprint']:
+                raise ValueError('模型文件与冻结策略的指纹不一致。')
+            models[method] = DeltaModel.load(model_path)
+            load_seconds[method] = time.perf_counter() - start
+    return configurations, models, load_seconds, bundle
+
+
 def collect(args):
     """按固定清单评价全部候选，复用相同组的离线观测，输出三张表和采集预算记录。"""
     start = time.perf_counter()
@@ -102,7 +159,12 @@ def collect(args):
     preparation_seconds = time.perf_counter() - start
     runtime = runtime_metadata(PROJECT_ROOT)
     graph_id = file_fingerprint(args.graph)
-    manifest = ensure_configuration(args.output / 'manifest.json', make_manifest(args, graph, runtime, graph_id))
+    supplied = read_json(args.manifest) if args.manifest else make_manifest(args, graph, runtime, graph_id)
+    if args.manifest:
+        verify_manifest_runtime(supplied, runtime, graph_id)
+        if any(i.get('split') == 'test' for i in supplied['instances']):
+            raise ValueError('最终测试只运行冻结策略，不采集全候选标签。')
+    manifest = ensure_configuration(args.output / 'manifest.json', supplied)
     config = manifest['configuration']
     options, repair_options = SolverOptions(**config['solver']), RepairOptions(**config['repair'])
     instances = manifest['instances'][:args.limit_instances]
@@ -131,7 +193,7 @@ def collect(args):
             context = FeatureContext(model, boundary)
             feature_seconds = time.perf_counter() - feature_start
             repair_start = time.perf_counter()
-            candidates = ([Candidate('stay', 'stay', 0.0, baseline)] if args.stage == 'A' else
+            candidates = ([Candidate('stay', 'stay', 0.0, baseline)] if config['stage'] == 'A' else
                           generate_candidates(context, baseline, repair_options))
             repair_seconds = time.perf_counter() - repair_start
             feature_seconds += context.compute_seconds
@@ -226,18 +288,27 @@ def evaluate(args):
     manifest = read_json(args.manifest)
     config = manifest['configuration']
     options, repair_options = SolverOptions(**config['solver']), RepairOptions(**config['repair'])
-    # 求解设置继承清单，防止复测命令的默认值悄悄改变已固定实验。
-    if file_fingerprint(args.graph) != config['graph_fingerprint']:
-        raise ValueError('复测路网与实例清单不一致。')
     runtime = runtime_metadata(PROJECT_ROOT)
-    for key in ('source_fingerprint', 'packages', 'distance_semantics', 'phase2_semantics', 'fallback'):
-        if runtime[key] != config['runtime'][key]:
-            raise ValueError(f'复测的 {key} 与采集清单不一致，请使用采集时的源码和依赖。')
+    verify_manifest_runtime(manifest, runtime, file_fingerprint(args.graph))
+    if args.methods is None:
+        args.methods = (['symmetric_mst', 'handcrafted'] + list(POLICY_METHODS) + ['random']
+                        if args.policy else list(BASE_METHODS))
+    args.methods = list(dict.fromkeys(args.methods))
     if 'symmetric_mst' not in args.methods:
         args.methods = ['symmetric_mst'] + args.methods
+    selections, models, model_load_seconds, bundle = load_frozen_policies(
+        args.policy, args.methods, manifest, args.selection_seed)
+    thresholds = dict(bundle['evaluation'] if bundle else config.get('evaluation', EvaluationOptions().to_dict()))
+    if args.cost_limit is not None:
+        thresholds['cost_limit'] = args.cost_limit
+    if args.min_phase2_saving is not None:
+        thresholds['min_phase2_saving'] = args.min_phase2_saving
     evaluation_config = {'manifest': fingerprint(manifest), 'runtime': runtime,
                          'solver': options.to_dict(), 'repair': repair_options.to_dict(),
                          'methods': args.methods, 'repeats': args.repeats,
+                         'evaluation': thresholds, 'split': config.get('split', 'development'),
+                         'policy_fingerprint': file_fingerprint(args.policy) if args.policy else None,
+                         'selections': {m: s.to_dict() for m, s in selections.items()},
                          'expected_instances': [row['id'] for row in manifest['instances']]}
     ensure_configuration(args.output / 'evaluation_config.json', {'configuration': evaluation_config})
     preparation_start = time.perf_counter()
@@ -263,6 +334,10 @@ def evaluate(args):
                         model = make_model(graph, distance, instance, config)
                         _, cost, process = solve_with_records(
                             model, partition_strategy=method, solver_options=options, repair_options=repair_options,
+                            selection_options=selections[method], selection_model=models.get(method),
+                            selection_repeat=repeat,
+                            selection_identity={'graph': config['graph_fingerprint'], 'instance': instance},
+                            expected_candidates=manifest.get('expected_candidates', {}).get(instance['id']),
                         )
                         online_seconds = time.perf_counter() - run_start
                     except (KeyboardInterrupt, Exception) as error:
@@ -288,6 +363,7 @@ def evaluate(args):
         table.export()
         save_json(args.output / 'map_preparation.json', {
             'preparation_seconds': preparation_seconds, 'distance_stats': distance_stats,
+            'model_load_seconds': model_load_seconds, 'model_policy': 'resident_models_actual_cold_load_recorded',
             'policy': 'one_time_shared_map_preparation',
         })
     print(f'独立复测完成：{args.output.resolve()}。', flush=True)

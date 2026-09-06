@@ -2,9 +2,11 @@
 
 本流程使用 CPU，在 NYC 1K 路网上检验客户划分对 Set-TSP 和最终配送的影响。阶段 A 采集 12 个诊断实例；阶段 B 采集 30 个开发实例及其候选，并独立复测手工选择器。所有命令在项目根目录执行。
 
+已完成 A/B 后，按 [阶段 C 服务器指南](partition_repair_stage_c_server_guide.md) 使用现有标签做分组诊断、训练 CPU 选择器和实际复测。当前总体成本增幅上限为 10%，第二阶段节时目标为 20%。下面的 A/B 命令用于另建采集实验。
+
 ## 运行环境
 
-激活服务器已有的 MA-FSTSP Python 环境，保证 `python` 指向该环境。需要 Python 3.10 及以上，以及项目已有的 NumPy、NetworkX、SciPy、gurobipy、elkai、osmnx、matplotlib。Gurobi 需要可用于目标规模的许可证。该流程不需要 GPU，也不加载神经网络。
+激活服务器已有的 MA-FSTSP Python 环境，保证 `python` 指向该环境。完整测试与阶段 C 使用 Python 3.11 及以上，以及项目已有的 NumPy、NetworkX、SciPy、gurobipy、elkai、osmnx、matplotlib。运行完整测试前安装 `requirements-partition-learning.txt` 中的 CPU 学习依赖。Gurobi 需要可用于目标规模的许可证。该流程不需要 GPU，也不加载神经网络。
 
 路网文件为 `datasets/nyc_1024.graphml`。第一步运行小图测试：
 
@@ -22,7 +24,7 @@ python -m unittest discover -s tests -p 'test_partition_repair_*.py' -v
 
 ```bash
 python -u scripts/collect_partition_candidates.py --stage A --output results/partition_repair/stage_a
-python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_a
+python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_a --output results/partition_repair/stage_a/report
 ```
 
 配置为 50/100/150 客户各 4 个新实例、5 个仓库、每车 3 架无人机。这里只评价对称 Set-MST 的 `stay` 分区，核对完整下游运行和耗时分解。
@@ -43,7 +45,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 
 ```bash
 python -u scripts/collect_partition_candidates.py --stage B --limit-instances 3 --output results/partition_repair/stage_b
-python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_b
+python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_b --output results/partition_repair/stage_b/report
 ```
 
 这 3 个实例分别为 50、100、150 客户。完整的 30 实例清单已经固定，因此试运行报告会显示 3/30，并明确标记尚未完成。候选按完整分区去重，最多 12 个，含 `stay`、不同人数修复前缀、两档变量负担修复、小簇迁移和一个局部迁移/交换候选。
@@ -54,7 +56,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 
 ```bash
 python -u scripts/collect_partition_candidates.py --stage B --output results/partition_repair/stage_b
-python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_b
+python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_b --output results/partition_repair/stage_b/report
 ```
 
 ## 第三步：在同一清单上独立复测
@@ -63,7 +65,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 
 ```bash
 python -u scripts/evaluate_partition_repair.py --manifest results/partition_repair/stage_b/manifest.json --output results/partition_repair/stage_b_evaluation
-python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_b_evaluation
+python scripts/analyze_partition_candidates.py --input results/partition_repair/stage_b_evaluation --output results/partition_repair/stage_b_evaluation/report
 ```
 
 默认比较以下方法：
@@ -74,7 +76,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 | `handcrafted` | 同一候选集上，用相对变量负担下降减去几何增量选择一次 |
 | `count_only` | 同一候选集上，选择人数平方和最小的划分 |
 | `burden_only` | 同一候选集上，选择总二元变量估计最少的划分 |
-| `random` | 在同一候选集中按固定种子选择 |
+| `random` | 在同一候选集中按实验种子、完整实例身份和重复编号稳定抽样 |
 | `original_mst` | 原始集合距离构图和 MST，作为附加对照 |
 
 候选选择方法共用生成规则和预算。直接 MST 方法无需生成修复候选。每次方法运行从模型构造前开始计时，重新生成所需分区，只真实求解选中的一个分区。程序不会通过求解其他候选的真实成本指导在线选择。
@@ -92,7 +94,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 
 | 文件 | 用途 |
 |---|---|
-| `candidate_report.json` | 总体成本预算为 0/1/3/5% 时的候选潜力、各规模结果和瓶颈 |
+| `candidate_report.json` | 总体成本预算为 0/1/3/5/7.5/10% 时的候选潜力、各规模结果和瓶颈 |
 | `candidate_curve.csv`、`candidate_curve.png` | 所有完整实例的候选成本—耗时关系 |
 | `oracle_per_instance.csv` | 事后最好选择下每个实例的变化，检查总体预算掩盖的个体退化 |
 | `evaluation_report.json` | 总体指标、逐规模统计、配对区间、第一阶段开销、超时与回退 |
@@ -105,7 +107,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 第二阶段节时 = 1 − Σ新方法完整第二阶段时间 / Σ对称MST完整第二阶段时间
 ```
 
-目标是总体成本增加不超过 5%、完整第二阶段节时至少 20%。逐实例可以超过 5%，因此报告同时列出超标数量、最坏成本恶化和最坏变慢。`passes_point_thresholds` 表示点估计达标；`thresholds_supported_by_ci95` 表示配对区间也位于门槛内。未完成实例会阻止完整通过判定。
+目标是总体成本增加不超过 10%、完整第二阶段节时至少 20%。逐实例可以超过 10%，因此报告同时列出超标数量、比例、最坏成本恶化和最坏变慢。`passes_point_thresholds` 表示点估计达标；`thresholds_supported_by_ci95` 表示配对区间也位于门槛内。未完成实例会阻止完整通过判定。
 
 `candidate_report` 的事后选择使用全部候选的真实答案和总体成本预算，是离线潜力诊断，不是可部署的策略。其区间只描述固定事后选择的样本波动。候选潜力达到约 30% 可为模型误差留出余量；若连 20% 潜力都没有，应先调整候选。若潜力充分而手工选择较弱，再进入监督学习。阶段 B 属于开发集，不能代替后续独立测试集验收。
 
@@ -115,7 +117,7 @@ python scripts/analyze_partition_candidates.py --input results/partition_repair/
 
 有可行解就使用现有解；没有可行解或客户边界为空时，采用按有向卡车距离的确定性最近邻顺序，再执行同一个第三阶段。回退时间计入完整第二阶段。间隙无穷大时保存 `gap=null`、`gap_is_finite=false`，保留可行解与限时状态。
 
-第三阶段执行原有 DP；长任务可用 Ctrl+C 中断。已经完成的组即时保存，当前中断组记录为未完成，不生成虚假的完整成本。相同命令重跑会继续未完成部分。源码、依赖、机器或求解配置变化后，采集应使用新结果目录；复测的算法源码和依赖须与采集一致。
+第三阶段执行原有 DP；长任务可用 Ctrl+C 中断。已经完成的组即时保存，当前中断组记录为未完成，不生成虚假的完整成本。相同命令重跑会继续未完成部分。源码、依赖、机器或求解配置变化后，采集应使用新结果目录。复测须匹配当前实验清单；在既有实例上比较新策略时，使用阶段 C 准备脚本派生当前清单、保留旧标签来源，并核对候选分区。
 
 地图和全点对距离按运行准备一次，所有方法共享相同的预计算距离。复测的 `online_seconds` 是模型构造至最终结果的实测墙钟；地图准备作为一次性成本单列。`cold_batch_seconds` 是按相同一次地图准备成本加到各方法整批在线时间上的冷批次口径，重复运行先在实例内取均值。
 

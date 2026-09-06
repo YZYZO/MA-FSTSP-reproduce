@@ -6,8 +6,9 @@ import time
 
 from .candidates import generate_candidates, symmetric_mst
 from .features import FeatureContext, canonical_partition
-from .selector import select_candidate
-from .settings import RepairOptions, SolverOptions
+from .selector import select_candidate, selection_seed
+from .settings import RepairOptions, SolverOptions, SelectionOptions
+from .storage import fingerprint
 
 
 def fixed_boundary(model):
@@ -84,16 +85,21 @@ def evaluate_partition(model, partition, boundary, solver_options=None, group_pr
     return dict(summarize_groups(records), depot_records=records)
 
 
-def solve_with_records(model, *, partition=None, partition_strategy='original_mst', solver_options=None, repair_options=None):
+def solve_with_records(model, *, partition=None, partition_strategy='original_mst', solver_options=None, repair_options=None,
+                       selection_options=None, selection_model=None, selection_repeat=0, selection_identity=None,
+                       expected_candidates=None):
     """输入模型和显式分区/选择策略，输出路线、成本、过程记录；普通 solve 与实验包装共用。"""
     total_start = time.perf_counter()
     solver_options = solver_options or SolverOptions()
     repair_options = repair_options or RepairOptions()
+    selection_options = selection_options or SelectionOptions()
     start = time.perf_counter()
     boundary = fixed_boundary(model)
     boundary_seconds = time.perf_counter() - start
     partition_seconds = feature_seconds = repair_seconds = selection_seconds = 0.0
     selected_name = 'explicit'
+    actual_selection_seed = None
+    candidates_fingerprint = None
     if partition is None:
         start = time.perf_counter()
         if partition_strategy == 'original_mst':
@@ -110,14 +116,21 @@ def solve_with_records(model, *, partition=None, partition_strategy='original_ms
             feature_seconds = time.perf_counter() - start
             start = time.perf_counter()
             candidates = generate_candidates(context, partition, repair_options)
+            # 复测既有实例时核对完整分区，不使用保存的成本或时间参与选择。
+            candidate_partitions = {c.name: c.partition for c in candidates}
+            candidates_fingerprint = fingerprint(candidate_partitions)
+            if expected_candidates is not None and candidates_fingerprint != expected_candidates:
+                raise ValueError('重建候选与来源清单不一致，不能作为同一候选集合的比较。')
             repair_seconds = time.perf_counter() - start
             # 候选生成中按需计算的组特征单独归入特征时间，避免与修复时间重叠。
             feature_seconds += context.compute_seconds
             repair_seconds = max(0.0, repair_seconds - context.compute_seconds)
             start = time.perf_counter()
             computed_before_selection = context.compute_seconds
+            actual_selection_seed = selection_seed(context, selection_options.seed, selection_repeat, selection_identity)
             selected = select_candidate(context, partition, candidates, partition_strategy,
-                                        repair_options.geometry_weight, solver_options.seed)
+                                        options=selection_options, model=selection_model,
+                                        repeat=selection_repeat, identity=selection_identity)
             selection_seconds = time.perf_counter() - start
             feature_delta = context.compute_seconds - computed_before_selection
             feature_seconds += feature_delta
@@ -140,6 +153,8 @@ def solve_with_records(model, *, partition=None, partition_strategy='original_ms
         'feature_seconds': feature_seconds, 'repair_seconds': repair_seconds,
         'selection_seconds': selection_seconds, 'selected_candidate': selected_name,
         'partition_strategy': partition_strategy, 'solver_options': solver_options.to_dict(),
+        'selection_options': selection_options.to_dict(), 'selection_seed': actual_selection_seed,
+        'candidate_fingerprint': candidates_fingerprint,
         'instance_initialization_seconds': getattr(model, 'initialization_seconds', 0.0),
         'solve_seconds': time.perf_counter() - total_start,
     }

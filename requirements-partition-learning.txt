@@ -1,0 +1,4 @@
+# 在已有 MA-FSTSP 环境中安装；学习流程仅使用 CPU。
+scikit-learn==1.9.0
+joblib==1.5.3
+threadpoolctl==3.6.0

@@ -556,7 +556,8 @@ class MultiAgentFlyingSidekickTSP(Baseline):
                         break
         return boundary_convex_sets
 
-    def solve(self, *, partition=None, partition_strategy='original_mst', solver_options=None, repair_options=None):
+    def solve(self, *, partition=None, partition_strategy='original_mst', solver_options=None, repair_options=None,
+              selection_options=None, selection_model=None, selection_repeat=0, selection_identity=None):
         """
         执行论文主算法的完整求解流程。
 
@@ -564,6 +565,8 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         - partition: 可选完整分区；传入时直接评价该分区。
         - partition_strategy: 分区方法名称，默认 original_mst。
         - solver_options、repair_options: 求解配置与候选生成配置。
+        - selection_options、selection_model: 冻结的选择配置与常驻模型。
+        - selection_repeat、selection_identity: 随机选择的重复编号与实例身份。
 
         输出：
         - `(self.solution, self.cost)`。
@@ -579,6 +582,8 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         solution, cost, _ = solve_with_records(
             self, partition=partition, partition_strategy=partition_strategy,
             solver_options=solver_options, repair_options=repair_options,
+            selection_options=selection_options, selection_model=selection_model,
+            selection_repeat=selection_repeat, selection_identity=selection_identity,
         )
         return solution, cost
 

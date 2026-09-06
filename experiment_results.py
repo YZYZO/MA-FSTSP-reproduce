@@ -81,13 +81,16 @@ def _json_array(records):
 
 
 def _solve_model_with_process_data(model, *, partition=None, partition_strategy='original_mst',
-                                   solver_options=None, repair_options=None):
-    """?????????/??????????????????????????"""
+                                   solver_options=None, repair_options=None, selection_options=None,
+                                   selection_model=None, selection_repeat=0, selection_identity=None):
+    """输入模型、显式分区或冻结策略，复用共同求解入口，输出路线、成本和完整过程记录。"""
     from src.partition_repair.evaluator import solve_with_records
 
     return solve_with_records(
         model, partition=partition, partition_strategy=partition_strategy,
         solver_options=solver_options, repair_options=repair_options,
+        selection_options=selection_options, selection_model=selection_model,
+        selection_repeat=selection_repeat, selection_identity=selection_identity,
     )
 
 
@@ -409,6 +412,7 @@ def _build_stsp_result_arrays(
         ], dtype=float),
         'partition_metadata_json': _json_array([
             {key: p.get(key) for key in ('partition_strategy', 'selected_candidate', 'solver_options',
+                                        'selection_options', 'selection_seed', 'candidate_fingerprint',
                                         'feature_seconds', 'repair_seconds', 'selection_seconds')}
             for p in processes
         ]),

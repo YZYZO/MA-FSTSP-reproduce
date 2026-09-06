@@ -76,7 +76,9 @@ pip install -r requirements.txt
 
 ## 如何运行实验
 
-客户划分修复的阶段 A/B 实验使用独立脚本，运行顺序、指标与断点续跑见 [服务器运行指南](docs/partition_repair_server_guide.md)。
+客户划分实验使用独立脚本，目标为总体配送成本增加不超过 **10%**、完整第二阶段节时至少 **20%**，允许个别实例超限并报告比例和最坏情况。
+
+已有阶段 B 标签可直接用于 CPU 学习诊断：比较统一调权、按规模调权、成本差与节时差回归。先安装 `requirements-partition-learning.txt`，再运行 `scripts/train_partition_selector.py --mode diagnose`；完整命令、后续采集和复测见 [阶段 C 服务器指南](docs/partition_repair_stage_c_server_guide.md)。阶段 C 需要 Python 3.11 及以上，使用已有 MA-FSTSP 环境即可。A/B 采集入口见 [分区实验指南](docs/partition_repair_server_guide.md)。
 
 ### 1. 选择并运行实验
 当前执行范围由 `experiments.py` 中的 `run_full_experiments()` 明确控制。确认其中启用的函数和规模后运行：
