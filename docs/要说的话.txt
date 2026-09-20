@@ -1,0 +1,13 @@
+我现在主要研究的论文是Optimization of Multi-Agent Flying Sidekick Traveling Salesman Problem over Road Networks（论文上网上找就行，不用打开pdf）；github仓库是Brelliothe MA-FSTSP 。这篇论文采用的是三阶段的架构，第一节阶段用mst进行客户划分，第二阶段使用集合tsp进行客户顺序求解，第三阶段 在给定顺序上分配车辆和无人机配送。目前我想集中于前两阶段，现在论文有一个缺陷是前面的客户划分不是平衡的，有可能会导致后面tsp规模过大，求解时间特别慢。还有，后面的目标函数和效率，也会取决于前面阶段的结果。我想知道有没有什么办法，能让客户划分能够考虑到后面的过程，换句话说，前面的阶段能够考虑到后面阶段的性能。不知道我有没有说明白。
+
+我现在想试一试就根据已有的实验结果results\服务器运行结果下载\260826_55k_master_results，看一下怎么设置标签，能通过学习的方法，让模型学到怎么划分能降低后面的成本或者时间。不过我觉得还要考虑路网上的事。因为这个原论文实在路网上进行的，可能不是欧氏距离那么简单。
+我最近看的两篇论文，一个是GLOPLearning Global Partition and Local Construction for Solving Large-scale Routing Problems in Real-time，我看这篇应该是分为全局策略和局部策略，全局策略学习划分，局部策略学习排序，我想参考这里的全局策略，不过全局策略不是监督学习，看一下能不能在这个论文的思路上改进我，我总是想试一下监督学习，讨论一下有没有可能；
+
+我听说transformer可以学习空间结构，真的假的，路网上的结构呢，讨论一下能不能做
+
+
+
+
+现在与我讨论一下如何做，主要是目前已有的实验数据能不能打标签，来进行监督学习
+
+python路径：D:\anaconda\envs\MA-FSTSP\python.exe
