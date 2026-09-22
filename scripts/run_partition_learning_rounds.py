@@ -31,8 +31,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--solver-time-limit",
         type=float,
-        default=9999.0,
-        help="每个仓库组的 Set-TSP 求解参数；9999 表示不向 Gurobi 设置时间上限。",
+        default=600.0,
+        help="每个仓库组的 Set-TSP 求解上限；默认600秒，9999表示完全不设上限。",
     )
     parser.add_argument(
         "--max-binary-variables",
@@ -43,8 +43,15 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--distance-batch-size", type=int, default=128)
     parser.add_argument("--candidates-per-instance", type=int, default=12)
     parser.add_argument("--active-pool-size", type=int, default=64)
-    parser.add_argument("--algorithm-instances-per-file", type=int, default=3)
-    parser.add_argument("--algorithm-candidates-per-instance", type=int, default=36)
+    parser.add_argument("--algorithm-instances-per-file", type=int, default=10)
+    parser.add_argument("--algorithm-candidates-per-instance", type=int, default=24)
+    parser.add_argument(
+        "--bootstrap-records",
+        type=Path,
+        nargs="*",
+        default=(),
+        help="复用既有 candidate_records.jsonl；同一来源已足额时不再求解新实例。",
+    )
     parser.add_argument(
         "--evaluation-workers",
         type=int,
@@ -88,6 +95,7 @@ def main() -> int:
         evaluation_workers=arguments.evaluation_workers,
         algorithm_instances_per_file=arguments.algorithm_instances_per_file,
         algorithm_candidates_per_instance=arguments.algorithm_candidates_per_instance,
+        bootstrap_record_paths=tuple(arguments.bootstrap_records),
     )
     if arguments.round == "oracle":
         experiment.run_oracle()

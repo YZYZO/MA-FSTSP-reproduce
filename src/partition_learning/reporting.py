@@ -426,6 +426,7 @@ def write_partition_algorithm_markdown(path: str | Path, result: dict[str, objec
         f"- 实例数：{algorithms['instance_count']}",
         f"- 客户规模：{', '.join(map(str, algorithms['customer_counts']))}",
         f"- 候选记录：{algorithms['row_count']}",
+        f"- 从既有实验复用的候选记录：{result.get('bootstrap_record_count', 0)}",
         f"- 可用于精确回归的候选：{algorithms['exact_candidate_count']}",
         f"- 候选与 MST 基线均精确、可用于相对改善回归的候选："
         f"{algorithms['relative_exact_candidate_count']}",
@@ -473,6 +474,7 @@ def write_partition_algorithm_markdown(path: str | Path, result: dict[str, objec
         "phase2_serial_seconds": "Phase 2 时间（秒）",
         "phase3_seconds": "Phase 3 时间（秒）",
         "downstream_total_seconds": "二三阶段总时间（秒）",
+        "solver_work_sum": "Gurobi Work（跨机器辅助标签）",
         "final_cost": "最终目标值",
     }
     for model_name, model_report in serial_training["models"].items():
@@ -485,4 +487,25 @@ def write_partition_algorithm_markdown(path: str | Path, result: dict[str, objec
                 f"{metrics['true_fastest_top3_hit_fraction']:.2%} | "
                 f"{metrics['predicted_fastest_mean_regret_ratio']:.2%} |"
             )
+    lines.extend([
+        "",
+        f"## 联合选择效果（成本变化不超过 {algorithms['cost_limit']:.0%}）",
+        "",
+        "策略先筛选模型预测成本可行的候选，再选择预测二三阶段总时间最短者；"
+        "若没有预测可行候选，则退回预测成本最低者。",
+        "",
+        "| 模型 | 测试实例 | 真实成本违反率 | 预测无可行候选 | 可行选择时间后悔 | "
+        "相对MST实际节时 | Oracle节时 |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for model_name, model_report in serial_training["models"].items():
+        metrics = model_report["joint_policy"]
+        lines.append(
+            f"| {model_name} | {metrics['instance_count']} | "
+            f"{metrics['true_cost_violation_fraction']:.2%} | "
+            f"{metrics['predicted_empty_feasible_fraction']:.2%} | "
+            f"{metrics['mean_feasible_time_regret_ratio']:.2%} | "
+            f"{metrics['mean_selected_time_saving_vs_mst']:.2%} | "
+            f"{metrics['mean_oracle_time_saving_vs_mst']:.2%} |"
+        )
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")

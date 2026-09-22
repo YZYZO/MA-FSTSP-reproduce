@@ -33,13 +33,16 @@ REGRESSION_TARGETS = (
     "phase2_serial_seconds",
     "phase3_seconds",
     "downstream_total_seconds",
+    "solver_work_sum",
     "cost_change_ratio",
     "final_cost",
 )
+TARGET_INDEX = {name: index for index, name in enumerate(REGRESSION_TARGETS)}
 POSITIVE_TARGETS = {
     "phase2_serial_seconds",
     "phase3_seconds",
     "downstream_total_seconds",
+    "solver_work_sum",
     "final_cost",
 }
 
@@ -91,6 +94,7 @@ class ModelEnsemble:
         time_saving = values("time_saving_ratio")
         cost_change = values("cost_change_ratio")
         downstream = values("downstream_total_seconds")
+        solver_work = values("solver_work_sum")
         final_cost = values("final_cost")
         standardized = (vector[0] - self.training_mean) / self.training_scale
         distances = np.sqrt(np.mean((self.standardized_training - standardized) ** 2, axis=1))
@@ -99,10 +103,12 @@ class ModelEnsemble:
             "mean_time_saving_ratio": float(np.mean(time_saving)),
             "mean_cost_change_ratio": float(np.mean(cost_change)),
             "mean_downstream_total_seconds": float(np.mean(downstream)),
+            "mean_solver_work_sum": float(np.mean(solver_work)),
             "mean_final_cost": float(np.mean(final_cost)),
             "time_uncertainty": float(np.std(time_saving)),
             "cost_uncertainty": float(np.std(cost_change)),
             "downstream_uncertainty": float(np.std(downstream)),
+            "solver_work_uncertainty": float(np.std(solver_work)),
             "final_cost_uncertainty": float(np.std(final_cost)),
             "mean_right_censored_probability": float(np.mean(values("right_censored_probability"))),
             "mean_guard_probability": float(np.mean(values("guard_probability"))),
@@ -112,7 +118,7 @@ class ModelEnsemble:
 
 def _records_to_dataset(records: Iterable[dict]) -> dict[str, object]:
     """
-    将候选记录转换为特征、六个回归目标、两个状态目标和实例分组。
+    将候选记录转换为特征、七个回归目标、两个状态目标和实例分组。
 
     新记录显式提供二三阶段总时间和精确性标志；旧记录缺少这些字段时，按
     `总时间=Phase 2`、`无删失且无回退=精确`兼容读取，但不会把保护回退用于精确回归。
@@ -137,12 +143,16 @@ def _records_to_dataset(records: Iterable[dict]) -> dict[str, object]:
             "downstream_total_seconds",
             evaluation.get("downstream_total_seconds", phase2 + phase3),
         ))
+        solver_work = float(labels.get(
+            "solver_work_sum", evaluation.get("solver_work_sum", 0.0)
+        ))
         final_cost = float(labels.get("final_cost", evaluation.get("final_cost", 0.0)))
         target_rows.append([
             float(labels["time_saving_ratio"]),
             phase2,
             phase3,
             downstream,
+            solver_work,
             float(labels["cost_change_ratio"]),
             final_cost,
         ])
@@ -295,6 +305,74 @@ def _group_ranking_metrics(
     }
 
 
+def _joint_policy_metrics(
+    actual_time: np.ndarray,
+    actual_cost_change: np.ndarray,
+    predicted_time: np.ndarray,
+    predicted_cost_change: np.ndarray,
+    groups: np.ndarray,
+    candidate_names: np.ndarray,
+    *,
+    cost_limit: float,
+) -> dict[str, float | int]:
+    """
+    评价“预测成本可行时选择预测最快划分”的完整决策策略。
+
+    输入为测试候选的真实/预测总时间、成本变化、实例分组与候选名；输出约束违反率、
+    可行选择的时间后悔率，以及相对 MST 保持划分的实际节时。若预测没有可行候选，
+    策略退回预测成本最低者，并单独记录该情况，避免把阈值失配悄悄隐藏。
+    """
+    violations, feasible_regrets, selected_savings, oracle_savings = [], [], [], []
+    predicted_empty = []
+    evaluated_instances = 0
+    for group in np.unique(groups):
+        indices = np.flatnonzero(groups == group)
+        true_feasible = indices[actual_cost_change[indices] <= cost_limit]
+        if len(true_feasible) == 0:
+            continue
+        predicted_feasible = indices[predicted_cost_change[indices] <= cost_limit]
+        predicted_empty.append(len(predicted_feasible) == 0)
+        if len(predicted_feasible):
+            selected = int(predicted_feasible[np.argmin(predicted_time[predicted_feasible])])
+        else:
+            selected = int(indices[np.argmin(predicted_cost_change[indices])])
+        oracle = int(true_feasible[np.argmin(actual_time[true_feasible])])
+        stay_candidates = indices[candidate_names[indices] == "stay"]
+        if len(stay_candidates) == 0:
+            continue
+        stay = int(stay_candidates[0])
+        baseline_time = max(float(actual_time[stay]), 1e-9)
+        is_violation = bool(actual_cost_change[selected] > cost_limit)
+        violations.append(is_violation)
+        if not is_violation:
+            oracle_time = max(float(actual_time[oracle]), 1e-9)
+            feasible_regrets.append(max(
+                0.0, (float(actual_time[selected]) - oracle_time) / oracle_time
+            ))
+        selected_savings.append((baseline_time - float(actual_time[selected])) / baseline_time)
+        oracle_savings.append((baseline_time - float(actual_time[oracle])) / baseline_time)
+        evaluated_instances += 1
+    return {
+        "cost_limit": float(cost_limit),
+        "instance_count": int(evaluated_instances),
+        "true_cost_violation_fraction": float(np.mean(violations)) if violations else 0.0,
+        "predicted_empty_feasible_fraction": float(np.mean(predicted_empty)) if predicted_empty else 0.0,
+        "feasible_selection_count": int(len(feasible_regrets)),
+        "mean_feasible_time_regret_ratio": (
+            float(np.mean(feasible_regrets)) if feasible_regrets else 0.0
+        ),
+        "median_feasible_time_regret_ratio": (
+            float(np.median(feasible_regrets)) if feasible_regrets else 0.0
+        ),
+        "mean_selected_time_saving_vs_mst": (
+            float(np.mean(selected_savings)) if selected_savings else 0.0
+        ),
+        "mean_oracle_time_saving_vs_mst": (
+            float(np.mean(oracle_savings)) if oracle_savings else 0.0
+        ),
+    }
+
+
 def _classifier_metrics(actual: np.ndarray, probability: np.ndarray) -> dict[str, float]:
     """计算状态概率的 Brier 分数、阳性比例，并在双类别测试集上计算 AUC。"""
     result = {
@@ -312,6 +390,7 @@ def train_model_ensemble(
     *,
     random_seed: int = 260915,
     test_fraction: float = 0.2,
+    cost_limit: float = 0.10,
 ) -> tuple[ModelEnsemble, dict[str, object]]:
     """
     以实例为单位划分数据，训练三类多目标性能预测器。
@@ -374,6 +453,7 @@ def train_model_ensemble(
         "test_relative_exact_row_count": int(len(test_relative_exact)),
         "feature_count": len(feature_names),
         "feature_names": list(feature_names),
+        "joint_policy_cost_limit": float(cost_limit),
         "regression_policy": {
             "absolute_targets": "candidate_exact_only",
             "relative_targets": "candidate_and_baseline_exact_only",
@@ -384,6 +464,7 @@ def train_model_ensemble(
     for model_offset, name in enumerate(MODEL_NAMES):
         fitted: dict[str, object] = {}
         model_report: dict[str, object] = {}
+        validation_models: dict[str, object] = {}
         for target_offset, target_name in enumerate(REGRESSION_TARGETS):
             target_values = targets[:, target_offset]
             is_relative_target = target_name in {"time_saving_ratio", "cost_change_ratio"}
@@ -398,16 +479,38 @@ def train_model_ensemble(
                 prediction = np.maximum(prediction, 0.0)
             metrics = _metric_dict(target_values[test_target_indices], prediction)
             if target_name in {
-                "phase2_serial_seconds", "phase3_seconds", "downstream_total_seconds", "final_cost"
+                "phase2_serial_seconds", "phase3_seconds", "downstream_total_seconds",
+                "solver_work_sum", "final_cost"
             }:
                 metrics.update(_group_ranking_metrics(
                     target_values[test_target_indices], prediction, groups[test_target_indices]
                 ))
             model_report[target_name] = metrics
+            validation_models[target_name] = model
 
             final_model = factory(name, random_seed + 50 * target_offset + model_offset)
             final_model.fit(matrix[final_target_indices], target_values[final_target_indices])
             fitted[target_name] = final_model
+
+        # 用同一留出实例同时预测成本和时间，评价模型最终会执行的联合选择，而非孤立 R²。
+        joint_time_prediction = np.maximum(
+            validation_models["downstream_total_seconds"].predict(matrix[test_relative_exact]),
+            0.0,
+        )
+        joint_cost_prediction = validation_models["cost_change_ratio"].predict(
+            matrix[test_relative_exact]
+        )
+        model_report["joint_policy"] = _joint_policy_metrics(
+            targets[test_relative_exact, TARGET_INDEX["downstream_total_seconds"]],
+            targets[test_relative_exact, TARGET_INDEX["cost_change_ratio"]],
+            joint_time_prediction,
+            joint_cost_prediction,
+            groups[test_relative_exact],
+            np.asarray([
+                str(rows[index].get("candidate_name", "")) for index in test_relative_exact
+            ]),
+            cost_limit=cost_limit,
+        )
 
         for label_offset, (label_name, label_values) in enumerate((
             ("right_censored", right_censored),

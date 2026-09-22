@@ -23,7 +23,7 @@ from .candidates import Partition, canonical_partition
 from .road import DroneDistanceMatrix, TerminalRoadMatrix
 
 
-EVALUATOR_VERSION = "set-tsp-v4-unlimited-exact-downstream-labels"
+EVALUATOR_VERSION = "set-tsp-v5-capped-censoring-downstream-labels"
 UNLIMITED_TIME_SENTINEL = 9999.0
 
 
@@ -367,7 +367,7 @@ def evaluate_group(
     drone_limit: float,
     drone_speed: float,
     cache: GroupEvaluationCache,
-    time_limit: float = 9999.0,
+    time_limit: float = 600.0,
     threads: int = 1,
     seed: int = 0,
     mip_gap: float = 1e-4,
@@ -604,7 +604,7 @@ def evaluate_partition(
     drone_limit: float,
     drone_speed: float,
     cache: GroupEvaluationCache,
-    time_limit: float = 9999.0,
+    time_limit: float = 600.0,
     threads: int = 1,
     seed: int = 0,
     mip_gap: float = 1e-4,
@@ -671,6 +671,7 @@ def evaluate_partition(
             "solver_status": solver.get("status"),
             "has_incumbent": bool(solver.get("has_incumbent", False)),
             "mip_gap": solver.get("mip_gap"),
+            "phase2_objective": solver.get("objective"),
             "solver_work": float(solver.get("solver_work", 0.0)),
             "num_variables": int(solver.get("num_variables", 0)),
             "num_binary_variables": int(solver.get("num_binary_variables", 0)),
@@ -690,6 +691,8 @@ def evaluate_partition(
     effective_times = [float(item["phase2_effective_seconds"]) for item in group_labels]
     runtime_label_valid = all(bool(item["runtime_label_valid"]) for item in group_labels)
     objective_label_exact = all(bool(item["objective_label_exact"]) for item in group_labels)
+    phase2_objectives = [item["phase2_objective"] for item in group_labels]
+    phase2_objective_complete = all(value is not None for value in phase2_objectives)
     right_censored_groups = sum(bool(item["right_censored"]) for item in group_labels)
     phase2_serial_effective_seconds = float(sum(effective_times))
     phase3_total_seconds = float(sum(record["phase3_seconds"] for record in group_records))
@@ -708,6 +711,12 @@ def evaluate_partition(
         "downstream_total_seconds": phase2_serial_effective_seconds + phase3_total_seconds,
         "runtime_label_valid": runtime_label_valid,
         "objective_label_exact": objective_label_exact,
+        # Set-TSP 目标值是第二阶段的辅助标签；最终优化目标仍使用 Phase 3 的 final_cost。
+        "phase2_objective_sum": (
+            float(sum(float(value) for value in phase2_objectives))
+            if phase2_objective_complete else None
+        ),
+        "phase2_objective_complete": phase2_objective_complete,
         "candidate_exact": runtime_label_valid and objective_label_exact and right_censored_groups == 0,
         "right_censored_groups": right_censored_groups,
         "timeout_groups": sum(bool(record["timeout"]) for record in group_records),

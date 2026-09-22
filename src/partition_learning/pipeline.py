@@ -16,7 +16,6 @@ from .candidates import (
     PartitionCandidate,
     generate_active_pool,
     generate_candidates,
-    partition_key,
 )
 from .dataset import (
     ExperimentInstance,
@@ -63,6 +62,112 @@ def _customer_count_from_result_path(path: Path) -> int:
     return int(path.stem.rsplit("-", 1)[-1])
 
 
+# 24候选的固定族配额：既覆盖直接分区算法，也保留多种局部动作强度。
+FAMILY_STRATIFIED_QUOTAS: tuple[tuple[str, int], ...] = (
+    ("action_bottleneck", 3),
+    ("action_pair_reassign", 3),
+    ("action_relocate", 3),
+    ("action_swap", 2),
+    ("anchored_balanced_graph", 2),
+    ("capacitated_road_kmedoids", 2),
+    ("constrained_multiroot_forest", 2),
+    ("generalized_assignment", 2),
+    ("legacy_balance", 1),
+    ("legacy_burden", 1),
+    ("legacy_cluster", 1),
+    ("legacy_road", 1),
+)
+
+
+def _spread_items(items: list, count: int) -> list:
+    """输入同一算法族的有序候选，输出覆盖首尾强度的等距子集。"""
+    if count >= len(items):
+        return list(items)
+    return [items[index] for index in select_instance_indices(len(items), count)]
+
+
+def _family_stratified_subset(items: list, limit: int, family_of, is_stay) -> list:
+    """
+    按算法族和动作强度选择固定预算候选。
+
+    输入为候选列表、数量上限及族/基线访问器；输出确定性子集。默认24个时包含MST、
+    全部主要算法族，并为直接分区和局部动作保留多个强度，避免简单截断造成族偏置。
+    """
+    if len(items) <= limit:
+        return list(items)
+    stay_items = [item for item in items if is_stay(item)]
+    selected = stay_items[:1]
+    used = {id(item) for item in selected}
+    buckets: dict[str, list] = {}
+    for item in items:
+        if id(item) in used:
+            continue
+        buckets.setdefault(str(family_of(item)), []).append(item)
+
+    if limit >= 24:
+        for family, quota in FAMILY_STRATIFIED_QUOTAS:
+            for item in _spread_items(buckets.get(family, []), quota):
+                if len(selected) >= limit:
+                    break
+                selected.append(item)
+                used.add(id(item))
+    else:
+        # 小预算仍先保证算法族覆盖，每轮从每族取一个尚未使用的候选。
+        family_order = [family for family, _ in FAMILY_STRATIFIED_QUOTAS]
+        while len(selected) < limit and any(buckets.get(family) for family in family_order):
+            for family in family_order:
+                remaining = [item for item in buckets.get(family, []) if id(item) not in used]
+                if remaining and len(selected) < limit:
+                    selected.append(remaining[0])
+                    used.add(id(remaining[0]))
+
+    # 某些实例可能因分区去重缺少某族；剩余额度按族轮询补齐。
+    family_order = [family for family, _ in FAMILY_STRATIFIED_QUOTAS]
+    family_order.extend(sorted(set(buckets) - set(family_order)))
+    while len(selected) < limit:
+        added = False
+        for family in family_order:
+            remaining = [item for item in buckets.get(family, []) if id(item) not in used]
+            if remaining and len(selected) < limit:
+                selected.append(remaining[0])
+                used.add(id(remaining[0]))
+                added = True
+        if not added:
+            break
+    return selected
+
+
+def _round_robin_sequences(sequences: list[list]) -> list:
+    """输入按来源分组的实例列表，输出逐轮交错的稳定顺序。"""
+    output = []
+    max_length = max((len(sequence) for sequence in sequences), default=0)
+    for position in range(max_length):
+        for sequence in sequences:
+            if position < len(sequence):
+                output.append(sequence[position])
+    return output
+
+
+def _quota_indices(total: int, quota: int, preferred: Iterable[int] = ()) -> list[int]:
+    """
+    以既有实例优先填充分层配额。
+
+    输入为文件实例总数、目标数和已存在下标；输出稳定下标。既有数量足够时只从其中等距取样，
+    不足时再从全文件的等距网格补齐，从而避免重复求解已经覆盖充分的来源。
+    """
+    preferred_values = sorted({int(index) for index in preferred if 0 <= int(index) < total})
+    if len(preferred_values) >= quota:
+        positions = select_instance_indices(len(preferred_values), quota)
+        return [preferred_values[position] for position in positions]
+    selected = list(preferred_values)
+    for index in select_instance_indices(total, min(total, quota)) + list(range(total)):
+        if index not in selected:
+            selected.append(index)
+        if len(selected) >= min(total, quota):
+            break
+    return sorted(selected)
+
+
 class ThreeRoundExperiment:
     """以可续跑缓存执行三轮候选评价、监督建模和主动扩充。"""
 
@@ -76,7 +181,7 @@ class ThreeRoundExperiment:
         active_pool_size: int = 64,
         active_selections_per_instance: int = 3,
         cost_limit: float = 0.10,
-        solver_time_limit: float = 9999.0,
+        solver_time_limit: float = 600.0,
         solver_threads: int = 1,
         solver_seed: int = 0,
         solver_mip_gap: float = 1e-4,
@@ -87,8 +192,9 @@ class ThreeRoundExperiment:
         only_graph: str | None = None,
         customer_counts: tuple[int, ...] | None = None,
         evaluation_workers: int = 1,
-        algorithm_instances_per_file: int = 3,
-        algorithm_candidates_per_instance: int = 36,
+        algorithm_instances_per_file: int = 10,
+        algorithm_candidates_per_instance: int = 24,
+        bootstrap_record_paths: tuple[str | Path, ...] = (),
     ):
         """
         保存输入、输出和统一实验预算。
@@ -109,6 +215,8 @@ class ThreeRoundExperiment:
         self.evaluation_workers = int(evaluation_workers)
         self.algorithm_instances_per_file = int(algorithm_instances_per_file)
         self.algorithm_candidates_per_instance = int(algorithm_candidates_per_instance)
+        # 既有精确候选可作为新一轮的种子数据，避免重复求解已经完成的实例。
+        self.bootstrap_record_paths = tuple(Path(path).resolve() for path in bootstrap_record_paths)
         self.execution_files = [
             path for path in self.result_files
             if (self.include_55k or "manhattan_55k" not in path.name)
@@ -163,6 +271,9 @@ class ThreeRoundExperiment:
             "evaluation_workers": 1,
             "algorithm_instances_per_file": int(self.algorithm_instances_per_file),
             "algorithm_candidates_per_instance": int(self.algorithm_candidates_per_instance),
+            "candidate_policy_version": "family_stratified_v1",
+            "instance_order": "source_round_robin_v1",
+            "bootstrap_record_paths": [str(path) for path in self.bootstrap_record_paths],
             "customer_counts": list(self.customer_counts) if self.customer_counts else None,
             "include_55k": bool(self.include_55k),
             "only_graph": self.only_graph,
@@ -217,6 +328,9 @@ class ThreeRoundExperiment:
                 "evaluation_workers": self.evaluation_workers,
                 "algorithm_instances_per_file": self.algorithm_instances_per_file,
                 "algorithm_candidates_per_instance": self.algorithm_candidates_per_instance,
+                "candidate_policy_version": "family_stratified_v1",
+                "instance_order": "source_round_robin_v1",
+                "bootstrap_record_paths": [str(path) for path in self.bootstrap_record_paths],
                 "algorithm_run_id": self.algorithm_run_id,
                 "evaluator_version": EVALUATOR_VERSION,
             },
@@ -251,7 +365,8 @@ class ThreeRoundExperiment:
             "server_command": (
                 "python scripts/run_partition_learning_rounds.py --round algorithms "
                 "--include-55k --only-graph manhattan_55k "
-                "--solver-time-limit 9999 --evaluation-workers 1 "
+                "--solver-time-limit 600 --evaluation-workers 1 "
+                "--algorithm-candidates-per-instance 24 "
                 "--output-dir results/partition_learning_260915_server_55k"
             ),
         })
@@ -479,6 +594,8 @@ class ThreeRoundExperiment:
             "phase2_optimize_seconds": float(evaluation["phase2_optimize_seconds"]),
             "phase2_distance_seconds": float(evaluation["phase2_distance_seconds"]),
             "solver_work_sum": float(evaluation["solver_work_sum"]),
+            "phase2_objective_sum": evaluation.get("phase2_objective_sum"),
+            "phase2_objective_complete": bool(evaluation.get("phase2_objective_complete", False)),
             "estimated_binary_variables_sum": int(evaluation["estimated_binary_variables_sum"]),
             "estimated_binary_variables_max": int(evaluation["estimated_binary_variables_max"]),
             "num_binary_variables_sum": int(evaluation["num_binary_variables_sum"]),
@@ -533,6 +650,8 @@ class ThreeRoundExperiment:
                     "phase2_serial_effective_seconds",
                     "phase3_seconds",
                     "downstream_total_seconds",
+                    "solver_work_sum",
+                    "phase2_objective_sum",
                     "final_cost",
                 ],
                 "regression_eligibility": {
@@ -616,18 +735,59 @@ class ThreeRoundExperiment:
         ]
         return self._attach_instance_ranks(records)
 
-    def _algorithm_instances(self) -> list[ExperimentInstance]:
+    def _algorithm_instances(
+        self,
+        preferred_by_source: dict[str, list[int]] | None = None,
+    ) -> list[ExperimentInstance]:
         """
-        按每个本地 NPZ 的等距分位点构造新划分算法实验实例。
+        按每个 NPZ 的配额构造新划分算法实验实例，并在不同来源间轮流执行。
 
-        输入来自实验配置；输出仅包含 1K/11K 的实例列表，绝不读取 55K NPZ。
+        输入可指定已有记录的实例下标；输出优先覆盖这些下标，再用等距分位点补齐。
+        每个来源先独立选样，最终按来源轮询，避免某一路网或规模连续占用数天。
         """
-        selected: list[ExperimentInstance] = []
+        preferred_by_source = preferred_by_source or {}
+        selected_by_source: list[list[ExperimentInstance]] = []
         for path in self.execution_files:
             with __import__("numpy").load(path, allow_pickle=True) as data:
                 total = int(len(data["instance_indices"]))
-            indices = select_instance_indices(total, self.algorithm_instances_per_file)
-            selected.extend(load_instances(path, indices))
+            indices = _quota_indices(
+                total,
+                self.algorithm_instances_per_file,
+                preferred_by_source.get(path.stem, ()),
+            )
+            selected_by_source.append(load_instances(path, indices))
+        return _round_robin_sequences(selected_by_source)
+
+    def _load_bootstrap_algorithm_records(self) -> list[dict]:
+        """
+        读取并裁剪其他实验目录中的已完成候选记录。
+
+        输入来自 ``bootstrap_record_paths`` 配置；输出按每实例当前候选预算分层选出的记录。
+        复用记录保留原始真值和求解口径，同时增加来源字段，便于报告追溯。
+        """
+        imported: list[dict] = []
+        for path in self.bootstrap_record_paths:
+            for source_record in read_jsonl(path):
+                record = dict(source_record)
+                record["reuse_provenance"] = {
+                    "kind": "bootstrap_candidate_record",
+                    "source_path": str(path),
+                }
+                imported.append(record)
+
+        by_instance: dict[str, list[dict]] = {}
+        for record in deduplicate_candidate_records(imported):
+            by_instance.setdefault(str(record["instance_id"]), []).append(record)
+        selected: list[dict] = []
+        for instance_records in by_instance.values():
+            selected.extend(_family_stratified_subset(
+                instance_records,
+                self.algorithm_candidates_per_instance,
+                family_of=lambda row: row.get("generator", {}).get(
+                    "family", row.get("candidate_kind", "unknown")
+                ),
+                is_stay=lambda row: row.get("candidate_name") == "stay",
+            ))
         return selected
 
     def _generate_algorithm_candidate_pool(
@@ -677,25 +837,13 @@ class ThreeRoundExperiment:
             affinity,
             max_per_action=4,
         )
-        stay = next(candidate for candidate in legacy if candidate.name == "stay")
-        buckets: dict[str, list[PartitionCandidate]] = {}
-        for candidate in legacy + direct + actions:
-            if candidate.name == "stay":
-                continue
-            buckets.setdefault(candidate.generator_family, []).append(candidate)
-        selected = [stay]
-        seen = {(stay.generator_family, partition_key(stay.partition, instance.depots))}
-        while len(selected) < self.algorithm_candidates_per_instance and any(buckets.values()):
-            for family in sorted(buckets):
-                if not buckets[family] or len(selected) >= self.algorithm_candidates_per_instance:
-                    continue
-                candidate = buckets[family].pop(0)
-                key = (candidate.generator_family, partition_key(candidate.partition, instance.depots))
-                if key in seen:
-                    continue
-                seen.add(key)
-                selected.append(candidate)
-        return selected
+        combined = legacy + direct + actions
+        return _family_stratified_subset(
+            combined,
+            self.algorithm_candidates_per_instance,
+            family_of=lambda candidate: candidate.generator_family or candidate.kind,
+            is_stay=lambda candidate: candidate.name == "stay",
+        )
 
     def _evaluate_algorithm_instance(
         self,
@@ -858,7 +1006,24 @@ class ThreeRoundExperiment:
         print(f"本次实验输出目录：{directory}", flush=True)
         output_path = directory / "candidate_records.jsonl"
         progress_path = directory / "completed_instances.json"
-        records = deduplicate_candidate_records(read_jsonl(output_path))
+        native_records = deduplicate_candidate_records(read_jsonl(output_path))
+        bootstrap_records = self._load_bootstrap_algorithm_records()
+        preferred_by_source: dict[str, list[int]] = {}
+        for record in native_records + bootstrap_records:
+            preferred_by_source.setdefault(str(record["source_name"]), []).append(
+                int(record["instance_index"])
+            )
+        instances = self._algorithm_instances(preferred_by_source)
+        selected_instance_ids = {instance.instance_id for instance in instances}
+        bootstrap_records = [
+            record for record in bootstrap_records
+            if record["instance_id"] in selected_instance_ids
+        ]
+        records = deduplicate_candidate_records([
+            record
+            for record in native_records + bootstrap_records
+            if record["instance_id"] in selected_instance_ids
+        ])
         for record in records:
             # 兼容在 timing_protocol 字段加入前已完成的同口径串行记录。
             record.setdefault("timing_protocol", {
@@ -868,6 +1033,8 @@ class ThreeRoundExperiment:
                     "phase2_serial_effective_seconds",
                     "phase3_seconds",
                     "downstream_total_seconds",
+                    "solver_work_sum",
+                    "phase2_objective_sum",
                     "final_cost",
                 ],
                 "regression_eligibility": {
@@ -881,13 +1048,29 @@ class ThreeRoundExperiment:
                 "solver_mip_gap": self.solver_mip_gap,
                 "max_binary_variables": self.max_binary_variables,
             })
+        records_per_instance: dict[str, int] = {}
+        for record in records:
+            instance_id = str(record["instance_id"])
+            records_per_instance[instance_id] = records_per_instance.get(instance_id, 0) + 1
         if progress_path.is_file():
-            completed = set(json.loads(progress_path.read_text(encoding="utf-8")))
+            progress_completed = set(json.loads(progress_path.read_text(encoding="utf-8")))
         else:
-            completed = set()
-        instances = self._algorithm_instances()
-        # 报告和模型只使用本次过滤条件覆盖的实例，避免历史 150 客户记录混入 50/100 实验。
-        selected_instance_ids = {instance.instance_id for instance in instances}
+            progress_completed = set()
+        # 历史记录只有在达到当前候选预算时才视为完整；当前目录的进度标志仍需至少有一条记录。
+        completed = {
+            instance_id
+            for instance_id, count in records_per_instance.items()
+            if count >= self.algorithm_candidates_per_instance
+        }
+        completed.update({
+            instance_id
+            for instance_id in progress_completed
+            if records_per_instance.get(instance_id, 0) > 0
+        })
+        print(
+            f"复用 {len(bootstrap_records)} 条历史候选；当前 {len(completed)}/{len(instances)} 个实例可跳过。",
+            flush=True,
+        )
         with GroupEvaluationCache(self.cache_path) as cache:
             for position, instance in enumerate(instances, start=1):
                 if instance.instance_id in completed:
@@ -905,9 +1088,7 @@ class ThreeRoundExperiment:
                 gc.collect()
         records = deduplicate_candidate_records(records)
         write_jsonl(output_path, records)
-        active_records = [
-            record for record in records if record["instance_id"] in selected_instance_ids
-        ]
+        active_records = list(records)
         # 单独保存本轮筛选后的训练数据，避免累计文件中的历史客户规模造成误用。
         write_jsonl(directory / "candidate_records_active.jsonl", active_records)
         report = self._algorithm_report(active_records, self.cost_limit)
@@ -919,6 +1100,7 @@ class ThreeRoundExperiment:
             serial_training_records,
             directory / "models_serial_only",
             random_seed=self.random_seed,
+            cost_limit=self.cost_limit,
         )
         # 混合模型只作为利用旧数据的探索对照，不用于声称严格串行时间精度。
         previous_records = read_jsonl(self.output_dir / "round2_supervised" / "candidate_records.jsonl")
@@ -932,11 +1114,13 @@ class ThreeRoundExperiment:
             combined_training_records,
             directory / "models_mixed_exploratory",
             random_seed=self.random_seed,
+            cost_limit=self.cost_limit,
         )
         result = {
             "run_id": self.algorithm_run_id,
             "run_directory": str(directory),
             "configuration": self.algorithm_run_configuration,
+            "bootstrap_record_count": len(bootstrap_records),
             "algorithms": report,
             "training_serial_only": serial_training_report,
             "training_mixed_exploratory": combined_training_report,
@@ -1004,6 +1188,7 @@ class ThreeRoundExperiment:
             records,
             directory / "models_initial",
             random_seed=self.random_seed,
+            cost_limit=self.cost_limit,
         )
 
     def _select_active_candidates(
@@ -1148,6 +1333,7 @@ class ThreeRoundExperiment:
                 supervised_records,
                 self.output_dir / "round2_supervised" / "models_initial",
                 random_seed=self.random_seed,
+                cost_limit=self.cost_limit,
             )
         directory = self.output_dir / "round3_active"
         output_path = directory / "candidate_records.jsonl"
@@ -1191,6 +1377,7 @@ class ThreeRoundExperiment:
             supervised_records + active_records,
             directory / "models_after_active",
             random_seed=self.random_seed,
+            cost_limit=self.cost_limit,
         )
         return updated_ensemble, {"acquisition": acquisition_summary, "training": training_report}
 
