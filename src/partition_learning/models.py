@@ -226,7 +226,8 @@ def _new_positive_regressor(name: str, random_seed: int):
 
 def _new_classifier(name: str, random_seed: int, labels: np.ndarray):
     """创建状态分类器；训练标签只有一个类别时返回固定概率模型。"""
-    if len(np.unique(labels)) < 2:
+    classes, class_counts = np.unique(labels, return_counts=True)
+    if len(classes) < 2:
         return DummyClassifier(strategy="constant", constant=int(labels[0]))
     if name == "ridge":
         return make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=500))
@@ -239,13 +240,16 @@ def _new_classifier(name: str, random_seed: int, labels: np.ndarray):
             random_state=random_seed,
         )
     if name == "shallow_mlp":
+        # early_stopping 会在内部做分层验证切分；少数类只有一条时 sklearn 会直接报错。
+        # 此处仍保留全部稀有状态样本训练，只关闭无法成立的内部验证切分。
+        use_early_stopping = bool(np.min(class_counts) >= 2 and len(labels) >= 20)
         return make_pipeline(
             StandardScaler(),
             MLPClassifier(
                 hidden_layer_sizes=(32, 16),
                 alpha=1e-3,
                 max_iter=600,
-                early_stopping=True,
+                early_stopping=use_early_stopping,
                 random_state=random_seed,
             ),
         )
