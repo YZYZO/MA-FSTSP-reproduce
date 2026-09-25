@@ -9,11 +9,13 @@
 """
 
 import elkai
-import gurobipy as gp
-from gurobipy import GRB
+# 原 Gurobi 依赖保留作迁移对照，当前实现已切换到 CP-SAT，不再执行以下导入。
+# import gurobipy as gp
+# from gurobipy import GRB
 import math
 import networkx as nx
 import numpy as np
+from ortools.sat.python import cp_model
 from .baseline import Baseline
 from utils import mst_partition
 
@@ -40,6 +42,11 @@ class MultiAgentFlyingSidekickTSP(Baseline):
     2. 为每个仓库准备客户分组容器。
     3. 预计算每个客户的可服务区域。
     """
+
+    # 每个仓库的集合 TSP 最多求解两分钟；达到时限但已有可行解时继续后续算法。
+    SET_TSP_TIME_LIMIT_SECONDS = 120.0
+    SET_TSP_RELATIVE_GAP = 1e-4
+
     def __init__(self, graph, depots, cities, distance, drone, limit=1.5, speed=1.6, theta=(0.5, 0.5)):
         super().__init__(graph, depots, cities, distance, drone, limit, speed)
         self.groups = {depot: [] for depot in depots}
@@ -169,7 +176,7 @@ class MultiAgentFlyingSidekickTSP(Baseline):
     @staticmethod
     def set_tsp(convex_sets, distance, convex_set_distance):
         """
-        求解集合化 TSP 顺序问题。
+        使用 OR-Tools CP-SAT 求解集合化 TSP 顺序问题。
 
         输入：
         - convex_sets: 各客户或仓库对应的候选点集合。
@@ -177,62 +184,193 @@ class MultiAgentFlyingSidekickTSP(Baseline):
         - convex_set_distance: 同一集合内部起点/终点切换代价。
 
         输出：
-        - 一个访问顺序 `seq`。
+        - 从集合 0 出发、访问全部集合并回到集合 0 的顺序 `seq`。
 
         实现逻辑：
-        1. 建立集合层面的 TSP 顺序变量。
-        2. 建立集合内部节点选择变量和集合间连接变量。
-        3. 用 Gurobi 求解后恢复访问顺序。
+        1. 使用原生 Circuit 约束直接保证集合层形成单一 Hamilton 回路。
+        2. 使用内部与外部布尔变量维持进入点、离开点和跨集合连接的一致性。
+        3. 在与原 Gurobi 默认值一致的相对误差范围内求解，并从选中弧恢复回路。
         """
         n = len(convex_sets)
-        model = gp.Model('Set-TSP')
-        #日志输出设置
-        model.setParam("OutputFlag", 0)
-        # first write a tsp for the visiting order of convex sets using GG model
-        select = model.addMVar((n, n), vtype=GRB.BINARY)
-        model.addConstrs(select[u, u] == 0 for u in range(n))
-        model.addConstrs(np.ones((n,)) @ select[:, v] == 1 for v in range(n))
-        model.addConstrs(np.ones((n,)) @ select[u, :] == 1 for u in range(n))
-        flow = model.addMVar((n, n), vtype=GRB.CONTINUOUS)
-        model.addConstrs(flow[u, v] <= n * select[u, v] for u in range(n) for v in range(n))
-        model.addConstr(np.ones((n,)) @ flow[0, :] == n - 1)
-        model.addConstr(np.ones((n,)) @ flow[:, 0] == 0)
-        model.addConstrs(flow[u, u] == 0 for u in range(n))
-        model.addConstrs(np.ones((n,)) @ flow[:, v] - np.ones((n,)) @ flow[v, :] == 1 for v in range(1, n))
+        model = cp_model.CpModel()
 
-        # internal is the selection of node pair inside each convex set
-        internal = [[[model.addVar(vtype=GRB.BINARY) for _ in convex_set] for _ in convex_set] for convex_set in
-                    convex_sets]
-        # external is the selection of node pair between two convex sets
-        external = [[[[model.addVar(vtype=GRB.BINARY) for _ in v] for _ in u] for v in convex_sets] for u in
-                    convex_sets]
-        model.addConstrs(gp.quicksum([internal[i][j][k] for j in range(len(convex_sets[i]))
-                                      for k in range(len(convex_sets[i]))]) == 1 for i in range(n))
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for i in range(len(convex_sets[u]))
-                                      for j in range(len(convex_sets[v]))]) == select[u, v]
-                         for u in range(n) for v in range(n))
-        # node j in convex sets v should have same out degree internal and in degree external
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for u in range(n) for i in range(len(convex_sets[u]))]) ==
-                         gp.quicksum([internal[v][j][k] for k in range(len(convex_sets[v]))]) for v in range(n)
-                         for j in range(len(convex_sets[v])))
-        # node i in convex sets u should have same in degree internal and out degree external
-        model.addConstrs(gp.quicksum([external[u][v][i][j] for v in range(n) for j in range(len(convex_sets[v]))]) ==
-                         gp.quicksum([internal[u][k][i] for k in range(len(convex_sets[u]))]) for u in range(n)
-                         for i in range(len(convex_sets[u])))
-        model.setObjective(gp.quicksum([convex_set_distance[i][j][k] * internal[i][j][k] for i in range(n)
-                                        for j in range(len(convex_sets[i])) for k in range(len(convex_sets[i]))]) +
-                           gp.quicksum([distance[u][v][i][j] * external[u][v][i][j] for u in range(n) for v in range(n)
-                                        for i in range(len(convex_sets[u])) for j in range(len(convex_sets[v]))]),
-                           GRB.MINIMIZE)
-        model.optimize()
+        # select[u][v] 表示集合访问顺序中是否从集合 u 前往集合 v。
+        select = [[None for _ in range(n)] for _ in range(n)]
+        circuit_arcs = []
+        for u in range(n):
+            for v in range(n):
+                if u == v:
+                    continue
+                select[u][v] = model.new_bool_var(f'select_{u}_{v}')
+                circuit_arcs.append((u, v, select[u][v]))
+        model.add_circuit(circuit_arcs)
 
+        # internal[i][j][k] 表示集合 i 选择候选点 j 进入、从候选点 k 离开。
+        internal = [
+            [
+                [model.new_bool_var(f'internal_{i}_{j}_{k}') for k, _ in enumerate(convex_set)]
+                for j, _ in enumerate(convex_set)
+            ]
+            for i, convex_set in enumerate(convex_sets)
+        ]
+        for i in range(n):
+            model.add_exactly_one(
+                internal[i][j][k]
+                for j in range(len(convex_sets[i]))
+                for k in range(len(convex_sets[i]))
+            )
+
+        # external 只创建不同集合之间可能选中的候选点连接，省去必为零的自连接变量。
+        external = {}
+        for u in range(n):
+            for v in range(n):
+                if u == v:
+                    continue
+                arc_variables = []
+                for i in range(len(convex_sets[u])):
+                    for j in range(len(convex_sets[v])):
+                        variable = model.new_bool_var(f'external_{u}_{v}_{i}_{j}')
+                        external[u, v, i, j] = variable
+                        arc_variables.append(variable)
+                model.add(sum(arc_variables) == select[u][v])
+
+        # 每个集合的进入候选点必须与所有选中入弧的终点一致。
+        for v in range(n):
+            for j in range(len(convex_sets[v])):
+                model.add(
+                    sum(
+                        external[u, v, i, j]
+                        for u in range(n)
+                        if u != v
+                        for i in range(len(convex_sets[u]))
+                    ) == sum(
+                        internal[v][j][k]
+                        for k in range(len(convex_sets[v]))
+                    )
+                )
+
+        # 每个集合的离开候选点必须与所有选中出弧的起点一致。
+        for u in range(n):
+            for i in range(len(convex_sets[u])):
+                model.add(
+                    sum(
+                        external[u, v, i, j]
+                        for v in range(n)
+                        if v != u
+                        for j in range(len(convex_sets[v]))
+                    ) == sum(
+                        internal[u][k][i]
+                        for k in range(len(convex_sets[u]))
+                    )
+                )
+
+        # CP-SAT Python 接口会对浮点目标系数进行确定性缩放，约束本身仍保持整数形式。
+        objective_variables = []
+        objective_coefficients = []
+        for i in range(n):
+            for j in range(len(convex_sets[i])):
+                for k in range(len(convex_sets[i])):
+                    objective_variables.append(internal[i][j][k])
+                    objective_coefficients.append(float(convex_set_distance[i][j][k]))
+        for u in range(n):
+            for v in range(n):
+                if u == v:
+                    continue
+                for i in range(len(convex_sets[u])):
+                    for j in range(len(convex_sets[v])):
+                        objective_variables.append(external[u, v, i, j])
+                        objective_coefficients.append(float(distance[u][v][i][j]))
+        model.minimize(
+            cp_model.LinearExpr.weighted_sum(
+                objective_variables,
+                objective_coefficients,
+            )
+        )
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = (
+            MultiAgentFlyingSidekickTSP.SET_TSP_TIME_LIMIT_SECONDS
+        )
+        solver.parameters.relative_gap_limit = (
+            MultiAgentFlyingSidekickTSP.SET_TSP_RELATIVE_GAP
+        )
+        solver.parameters.num_search_workers = 0
+        status = solver.solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError(
+                f'CP-SAT 未找到集合 TSP 可行解，当前状态：{solver.status_name(status)}'
+            )
+
+        # 从集合 0 出发，沿被选中的集合间弧恢复完整回路。
         seq = [0]
-        while seq.count(0) < 2:
-            for j in range(n):
-                if select[seq[-1], j].X > 0.99:
-                    seq.append(j)
-                    break
+        while len(seq) <= n:
+            current = seq[-1]
+            next_set = next(
+                (
+                    j for j in range(n)
+                    if j != current and solver.boolean_value(select[current][j])
+                ),
+                None,
+            )
+            if next_set is None:
+                raise RuntimeError(f'CP-SAT 解中集合 {current} 没有后继集合')
+            seq.append(next_set)
+            if next_set == 0:
+                break
+
+        if len(seq) != n + 1 or seq[-1] != 0 or len(set(seq[:-1])) != n:
+            raise RuntimeError(f'CP-SAT 返回的集合 TSP 回路不完整：{seq}')
         return seq
+
+        # 原 Gurobi 实现保留作迁移对照，当前不执行。
+        # n = len(convex_sets)
+        # model = gp.Model('Set-TSP')
+        # # 日志输出设置
+        # model.setParam("OutputFlag", 0)
+        # # 使用 GG 单商品流模型描述集合访问顺序
+        # select = model.addMVar((n, n), vtype=GRB.BINARY)
+        # model.addConstrs(select[u, u] == 0 for u in range(n))
+        # model.addConstrs(np.ones((n,)) @ select[:, v] == 1 for v in range(n))
+        # model.addConstrs(np.ones((n,)) @ select[u, :] == 1 for u in range(n))
+        # flow = model.addMVar((n, n), vtype=GRB.CONTINUOUS)
+        # model.addConstrs(flow[u, v] <= n * select[u, v] for u in range(n) for v in range(n))
+        # model.addConstr(np.ones((n,)) @ flow[0, :] == n - 1)
+        # model.addConstr(np.ones((n,)) @ flow[:, 0] == 0)
+        # model.addConstrs(flow[u, u] == 0 for u in range(n))
+        # model.addConstrs(np.ones((n,)) @ flow[:, v] - np.ones((n,)) @ flow[v, :] == 1 for v in range(1, n))
+        # # internal 表示每个候选集合内部选中的进入点和离开点
+        # internal = [[[model.addVar(vtype=GRB.BINARY) for _ in convex_set] for _ in convex_set]
+        #             for convex_set in convex_sets]
+        # # external 表示两个候选集合之间选中的连接点对
+        # external = [[[[model.addVar(vtype=GRB.BINARY) for _ in v] for _ in u]
+        #              for v in convex_sets] for u in convex_sets]
+        # model.addConstrs(gp.quicksum([internal[i][j][k] for j in range(len(convex_sets[i]))
+        #                               for k in range(len(convex_sets[i]))]) == 1 for i in range(n))
+        # model.addConstrs(gp.quicksum([external[u][v][i][j] for i in range(len(convex_sets[u]))
+        #                               for j in range(len(convex_sets[v]))]) == select[u, v]
+        #                  for u in range(n) for v in range(n))
+        # model.addConstrs(
+        #     gp.quicksum([external[u][v][i][j] for u in range(n) for i in range(len(convex_sets[u]))]) ==
+        #     gp.quicksum([internal[v][j][k] for k in range(len(convex_sets[v]))])
+        #     for v in range(n) for j in range(len(convex_sets[v])))
+        # model.addConstrs(
+        #     gp.quicksum([external[u][v][i][j] for v in range(n) for j in range(len(convex_sets[v]))]) ==
+        #     gp.quicksum([internal[u][k][i] for k in range(len(convex_sets[u]))])
+        #     for u in range(n) for i in range(len(convex_sets[u])))
+        # model.setObjective(
+        #     gp.quicksum([convex_set_distance[i][j][k] * internal[i][j][k] for i in range(n)
+        #                  for j in range(len(convex_sets[i])) for k in range(len(convex_sets[i]))]) +
+        #     gp.quicksum([distance[u][v][i][j] * external[u][v][i][j] for u in range(n) for v in range(n)
+        #                  for i in range(len(convex_sets[u])) for j in range(len(convex_sets[v]))]),
+        #     GRB.MINIMIZE)
+        # model.optimize()
+        # seq = [0]
+        # while seq.count(0) < 2:
+        #     for j in range(n):
+        #         if select[seq[-1], j].X > 0.99:
+        #             seq.append(j)
+        #             break
+        # return seq
 
     def local_search_multi_drone_appr(self, seq, depot):
         """
