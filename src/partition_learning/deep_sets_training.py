@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import copy
 import json
 from pathlib import Path
@@ -25,11 +25,12 @@ from .deep_sets import (
 )
 from .deep_sets_data import (
     DeepSetsCandidateDataset,
+    InstanceSplit,
     InstanceBatchSampler,
     collate_deepsets,
     global_feature_normalizer,
     select_global_feature_indices,
-    split_instance_ids,
+    split_instance_ids_three_way,
 )
 from .models import REGRESSION_TARGETS, TARGET_INDEX
 
@@ -39,6 +40,7 @@ class DeepSetsTrainingConfig:
     """保存可复现实验所需的训练超参数。"""
 
     random_seed: int = 260915
+    validation_fraction: float = 0.20
     test_fraction: float = 0.20
     hidden_dim: int = 64
     dropout: float = 0.10
@@ -48,6 +50,7 @@ class DeepSetsTrainingConfig:
     patience: int = 30
     instances_per_batch: int = 2
     include_method_features: bool = False
+    model_variant: str = "fused"
     device: str = "auto"
 
 
@@ -216,6 +219,51 @@ def _joint_policy_metrics(
     }
 
 
+def evaluate_candidate_predictions(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    masks: np.ndarray,
+    instance_ids: np.ndarray,
+    candidate_names: np.ndarray,
+    *,
+    cost_limit: float,
+) -> dict[str, Any]:
+    """
+    统一评价候选划分的多目标回归与联合选择表现。
+
+    输入真实值、预测值、标签掩码及实例信息；输出可供神经网络和人工特征基线共用的报告。
+    """
+    report: dict[str, Any] = {"regression": {}}
+    for target_index, target_name in enumerate(REGRESSION_TARGETS):
+        mask = masks[:, target_index]
+        metrics = _regression_metrics(actual[mask, target_index], predicted[mask, target_index])
+        if target_name in {
+            "phase2_serial_seconds", "phase3_seconds", "downstream_total_seconds",
+            "solver_work_sum", "final_cost",
+        }:
+            metrics.update(_within_instance_metrics(
+                actual[mask, target_index],
+                predicted[mask, target_index],
+                instance_ids[mask],
+            ))
+        report["regression"][target_name] = metrics
+
+    relative_mask = (
+        masks[:, TARGET_INDEX["time_saving_ratio"]]
+        & masks[:, TARGET_INDEX["cost_change_ratio"]]
+    )
+    report["joint_policy"] = _joint_policy_metrics(
+        actual[relative_mask, TARGET_INDEX["downstream_total_seconds"]],
+        actual[relative_mask, TARGET_INDEX["cost_change_ratio"]],
+        predicted[relative_mask, TARGET_INDEX["downstream_total_seconds"]],
+        predicted[relative_mask, TARGET_INDEX["cost_change_ratio"]],
+        instance_ids[relative_mask],
+        candidate_names[relative_mask],
+        cost_limit,
+    )
+    return report
+
+
 @torch.no_grad()
 def evaluate_deepsets(
     model: HierarchicalDeepSets,
@@ -260,28 +308,13 @@ def evaluate_deepsets(
     masks = np.concatenate(mask_rows)
     ids = np.asarray(instance_ids)
     names = np.asarray(candidate_names)
-    report: dict[str, Any] = {"regression": {}}
-    for target_index, target_name in enumerate(REGRESSION_TARGETS):
-        mask = masks[:, target_index]
-        metrics = _regression_metrics(actual[mask, target_index], predicted[mask, target_index])
-        if target_name in {
-            "phase2_serial_seconds", "phase3_seconds", "downstream_total_seconds",
-            "solver_work_sum", "final_cost",
-        }:
-            metrics.update(_within_instance_metrics(
-                actual[mask, target_index], predicted[mask, target_index], ids[mask]
-            ))
-        report["regression"][target_name] = metrics
-
-    relative_mask = masks[:, TARGET_INDEX["time_saving_ratio"]] & masks[:, TARGET_INDEX["cost_change_ratio"]]
-    report["joint_policy"] = _joint_policy_metrics(
-        actual[relative_mask, TARGET_INDEX["downstream_total_seconds"]],
-        actual[relative_mask, TARGET_INDEX["cost_change_ratio"]],
-        predicted[relative_mask, TARGET_INDEX["downstream_total_seconds"]],
-        predicted[relative_mask, TARGET_INDEX["cost_change_ratio"]],
-        ids[relative_mask],
-        names[relative_mask],
-        cost_limit,
+    report = evaluate_candidate_predictions(
+        actual,
+        predicted,
+        masks,
+        ids,
+        names,
+        cost_limit=cost_limit,
     )
     censor_y = np.concatenate(censored_actual)
     censor_p = np.concatenate(censored_probability)
@@ -293,17 +326,18 @@ def evaluate_deepsets(
         feasible_y[feasible_valid], feasible_p[feasible_valid]
     )
 
-    group_valid = np.concatenate(group_mask)
-    group_y = np.concatenate(group_actual)
-    group_p = np.concatenate(group_predicted)
-    report["group_phase2_seconds"] = _regression_metrics(
-        group_y[group_valid], group_p[group_valid]
-    )
-    group_censor_y = np.concatenate(group_censored_actual)
-    group_censor_p = np.concatenate(group_censored_probability)
-    report["group_right_censored"] = _classification_metrics(
-        group_censor_y, group_censor_p
-    )
+    if model.uses_deep_sets:
+        group_valid = np.concatenate(group_mask)
+        group_y = np.concatenate(group_actual)
+        group_p = np.concatenate(group_predicted)
+        report["group_phase2_seconds"] = _regression_metrics(
+            group_y[group_valid], group_p[group_valid]
+        )
+        group_censor_y = np.concatenate(group_censored_actual)
+        group_censor_p = np.concatenate(group_censored_probability)
+        report["group_right_censored"] = _classification_metrics(
+            group_censor_y, group_censor_p
+        )
     return report
 
 
@@ -313,35 +347,60 @@ def train_deepsets(
     *,
     training_config: DeepSetsTrainingConfig | None = None,
     loss_config: DeepSetsLossConfig | None = None,
+    instance_split: InstanceSplit | None = None,
 ) -> tuple[HierarchicalDeepSets, dict[str, Any]]:
     """
-    在实例级切分上训练层次化 Deep Sets，并保存模型与评估报告。
+    在实例级训练/验证/测试切分上训练指定消融结构，并保存模型与评估报告。
 
-    输入张量缓存和输出目录；输出已用全部训练实例拟合的最佳模型及可序列化报告。
+    输入张量缓存、输出目录及可选固定切分；输出由验证集选出的模型及独立测试报告。
     """
     config = training_config or DeepSetsTrainingConfig()
     losses = loss_config or DeepSetsLossConfig()
+    if config.model_variant == "global_mlp":
+        # 纯全局MLP没有仓库组表示，关闭只依赖Deep Sets分支的辅助任务。
+        losses = replace(
+            losses,
+            group_time=0.0,
+            group_right_censored=0.0,
+            group_sum_consistency=0.0,
+        )
     _seed_everything(config.random_seed)
     device = _resolve_device(config.device)
-    train_ids, test_ids = split_instance_ids(
-        cache, test_fraction=config.test_fraction, random_seed=config.random_seed
+    split = instance_split or split_instance_ids_three_way(
+        cache,
+        validation_fraction=config.validation_fraction,
+        test_fraction=config.test_fraction,
+        random_seed=config.random_seed,
     )
-    feature_indices, selected_feature_names = select_global_feature_indices(
-        cache, include_method_features=config.include_method_features
-    )
+    if config.model_variant == "deepsets_only":
+        feature_indices = np.zeros(0, dtype=np.int64)
+        selected_feature_names: tuple[str, ...] = ()
+    else:
+        feature_indices, selected_feature_names = select_global_feature_indices(
+            cache, include_method_features=config.include_method_features
+        )
     feature_mean, feature_scale = global_feature_normalizer(
-        cache, train_ids, feature_indices
+        cache, split.train_ids, feature_indices
     )
     train_dataset = DeepSetsCandidateDataset(
-        cache, train_ids, feature_indices, feature_mean, feature_scale
+        cache, split.train_ids, feature_indices, feature_mean, feature_scale
+    )
+    validation_dataset = DeepSetsCandidateDataset(
+        cache, split.validation_ids, feature_indices, feature_mean, feature_scale
     )
     test_dataset = DeepSetsCandidateDataset(
-        cache, test_ids, feature_indices, feature_mean, feature_scale
+        cache, split.test_ids, feature_indices, feature_mean, feature_scale
     )
     train_sampler = InstanceBatchSampler(
         train_dataset,
         instances_per_batch=config.instances_per_batch,
         shuffle=True,
+        random_seed=config.random_seed,
+    )
+    validation_sampler = InstanceBatchSampler(
+        validation_dataset,
+        instances_per_batch=config.instances_per_batch,
+        shuffle=False,
         random_seed=config.random_seed,
     )
     test_sampler = InstanceBatchSampler(
@@ -352,6 +411,12 @@ def train_deepsets(
     )
     train_loader = DataLoader(
         train_dataset, batch_sampler=train_sampler, collate_fn=collate_deepsets, num_workers=0
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_sampler=validation_sampler,
+        collate_fn=collate_deepsets,
+        num_workers=0,
     )
     test_loader = DataLoader(
         test_dataset, batch_sampler=test_sampler, collate_fn=collate_deepsets, num_workers=0
@@ -366,6 +431,7 @@ def train_deepsets(
         global_feature_dim=len(selected_feature_names),
         hidden_dim=config.hidden_dim,
         dropout=config.dropout,
+        model_variant=config.model_variant,
     )
     model = HierarchicalDeepSets(model_config).to(device)
     optimizer = torch.optim.AdamW(
@@ -380,7 +446,7 @@ def train_deepsets(
     for epoch in range(config.max_epochs):
         train_sampler.set_epoch(epoch)
         train_losses = _run_epoch(model, train_loader, device, losses, optimizer)
-        validation_losses = _run_epoch(model, test_loader, device, losses, None)
+        validation_losses = _run_epoch(model, validation_loader, device, losses, None)
         history.append({
             "epoch": epoch + 1,
             "train": train_losses,
@@ -396,7 +462,8 @@ def train_deepsets(
             stale_epochs += 1
         if epoch == 0 or (epoch + 1) % 10 == 0:
             print(
-                f"[DeepSets] epoch={epoch + 1} train={train_losses['total']:.4f} "
+                f"[{config.model_variant}] epoch={epoch + 1} "
+                f"train={train_losses['total']:.4f} "
                 f"validation={validation_total:.4f}",
                 flush=True,
             )
@@ -404,13 +471,18 @@ def train_deepsets(
             break
 
     model.load_state_dict(best_state)
-    evaluation = evaluate_deepsets(
+    validation_evaluation = evaluate_deepsets(
+        model, validation_loader, device, cost_limit=float(cache["cost_limit"])
+    )
+    test_evaluation = evaluate_deepsets(
         model, test_loader, device, cost_limit=float(cache["cost_limit"])
     )
     report = {
-        "train_instance_count": len(train_ids),
-        "test_instance_count": len(test_ids),
+        "train_instance_count": len(split.train_ids),
+        "validation_instance_count": len(split.validation_ids),
+        "test_instance_count": len(split.test_ids),
         "train_candidate_count": len(train_dataset),
+        "validation_candidate_count": len(validation_dataset),
         "test_candidate_count": len(test_dataset),
         "selected_global_feature_count": len(selected_feature_names),
         "selected_global_feature_names": list(selected_feature_names),
@@ -419,16 +491,18 @@ def train_deepsets(
         "training_config": asdict(config),
         "loss_config": asdict(losses),
         "model_config": asdict(model_config),
-        "train_instance_ids": list(train_ids),
-        "test_instance_ids": list(test_ids),
-        "evaluation": evaluation,
+        "train_instance_ids": list(split.train_ids),
+        "validation_instance_ids": list(split.validation_ids),
+        "test_instance_ids": list(split.test_ids),
+        "validation_evaluation": validation_evaluation,
+        "evaluation": test_evaluation,
         "history": history,
     }
 
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
     checkpoint = {
-        "format_version": 1,
+        "format_version": 2,
         "model_config": asdict(model_config),
         "model_state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
         "global_feature_names": selected_feature_names,

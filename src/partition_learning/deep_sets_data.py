@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 import math
 from pathlib import Path
 import random
@@ -46,6 +47,15 @@ GROUP_FEATURE_NAMES = (
     "depot_x", "depot_y", "log_in_degree", "log_out_degree", "customer_fraction",
     "boundary_fraction", "log_variable_proxy", "empty_group",
 )
+
+
+@dataclass(frozen=True)
+class InstanceSplit:
+    """保存互不重叠的训练、验证和测试实例编号。"""
+
+    train_ids: tuple[str, ...]
+    validation_ids: tuple[str, ...]
+    test_ids: tuple[str, ...]
 
 
 def _partition_from_record(payload: dict[str, Sequence[int]]) -> dict[int, tuple[int, ...]]:
@@ -468,10 +478,75 @@ def split_instance_ids(
     return tuple(sorted(train_ids)), tuple(sorted(test_ids))
 
 
+def split_instance_ids_three_way(
+    cache: dict[str, Any],
+    *,
+    validation_fraction: float = 0.20,
+    test_fraction: float = 0.20,
+    random_seed: int = 260915,
+) -> InstanceSplit:
+    """
+    按路网与客户规模分层生成训练、验证和测试实例。
+
+    验证集只负责提前停止，测试集在最终模型确定前不会参与训练过程。若同一分层至少有
+    三个包含超时候选的实例，则训练、验证和测试各保留一个，避免状态任务无法评估。
+    回归标签缺失由候选级掩码处理，因此这些实例仍可用于评估超时分类。
+    """
+    strata: dict[tuple[str, int], set[str]] = defaultdict(set)
+    all_ids = set(cache["instances"])
+    for instance_id, instance in cache["instances"].items():
+        strata[(instance["graph_name"], int(instance["customer_count"]))].add(instance_id)
+
+    generator = random.Random(random_seed)
+    validation_ids: set[str] = set()
+    test_ids: set[str] = set()
+    censored_counts: dict[str, int] = defaultdict(int)
+    for record in cache["records"]:
+        if bool(record["right_censored"]):
+            censored_counts[record["instance_id"]] += 1
+    censored_instance_ids = set(censored_counts)
+    for stratum, instance_ids in sorted(strata.items()):
+        test_count = max(1, int(round(test_fraction * len(instance_ids))))
+        validation_count = max(1, int(round(validation_fraction * len(instance_ids))))
+        if test_count + validation_count >= len(instance_ids):
+            raise ValueError(f"分层 {stratum} 的实例数不足以同时划分训练、验证和测试集。")
+
+        censored = sorted(
+            set(instance_ids) & censored_instance_ids,
+            key=lambda instance_id: (-censored_counts[instance_id], instance_id),
+        )
+        ordinary = sorted(set(instance_ids) - censored_instance_ids)
+        generator.shuffle(ordinary)
+
+        # 至少保留一个超时实例用于训练；其余优先覆盖测试和验证状态评价。
+        available_censored = censored[1:]
+        selected_test = available_censored[:1]
+        selected_validation = available_censored[1:2]
+        remaining = available_censored[2:] + ordinary
+        generator.shuffle(remaining)
+        test_needed = test_count - len(selected_test)
+        selected_test.extend(remaining[:test_needed])
+        remaining = remaining[test_needed:]
+        validation_needed = validation_count - len(selected_validation)
+        selected_validation.extend(remaining[:validation_needed])
+
+        test_ids.update(selected_test)
+        validation_ids.update(selected_validation)
+
+    train_ids = all_ids - validation_ids - test_ids
+    return InstanceSplit(
+        train_ids=tuple(sorted(train_ids)),
+        validation_ids=tuple(sorted(validation_ids)),
+        test_ids=tuple(sorted(test_ids)),
+    )
+
+
 def global_feature_normalizer(
     cache: dict[str, Any], train_instance_ids: Sequence[str], feature_indices: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """输入训练实例和全局特征列，输出仅由训练集计算的均值与标准差。"""
+    if len(feature_indices) == 0:
+        return np.zeros(0, dtype=np.float32), np.ones(0, dtype=np.float32)
     allowed = set(train_instance_ids)
     matrix = np.stack([
         record["global_features"][feature_indices]

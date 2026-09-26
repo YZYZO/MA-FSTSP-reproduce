@@ -12,6 +12,9 @@ from torch.nn import functional as F
 from .models import REGRESSION_TARGETS, TARGET_INDEX
 
 
+MODEL_VARIANTS = ("deepsets_only", "global_mlp", "fused")
+
+
 # 正值目标在数据集中使用 log1p 编码，降低长尾求解时间对训练的支配作用。
 POSITIVE_TARGET_INDICES = tuple(
     TARGET_INDEX[name]
@@ -74,7 +77,7 @@ class DeepSetBatch:
 
 @dataclass(frozen=True)
 class DeepSetsModelConfig:
-    """保存层次化 Deep Sets 的输入维度和网络宽度。"""
+    """保存层次化 Deep Sets 的输入维度、网络宽度与消融结构。"""
 
     boundary_feature_dim: int
     customer_static_dim: int
@@ -83,6 +86,7 @@ class DeepSetsModelConfig:
     global_feature_dim: int
     hidden_dim: int = 64
     dropout: float = 0.10
+    model_variant: str = "fused"
 
 
 @dataclass(frozen=True)
@@ -94,8 +98,11 @@ class DeepSetsLossConfig:
     right_censored: float = 0.20
     group_right_censored: float = 0.15
     cost_feasible: float = 0.20
-    ranking: float = 0.30
-    sum_consistency: float = 0.15
+    time_ranking: float = 0.15
+    cost_ranking: float = 0.15
+    feasible_time_ranking: float = 0.20
+    group_sum_consistency: float = 0.15
+    downstream_consistency: float = 0.15
 
 
 class _MLP(nn.Module):
@@ -150,22 +157,39 @@ class HierarchicalDeepSets(nn.Module):
 
     def __init__(self, config: DeepSetsModelConfig):
         super().__init__()
+        if config.model_variant not in MODEL_VARIANTS:
+            raise ValueError(f"未知模型结构：{config.model_variant}")
         self.config = config
         hidden = config.hidden_dim
         dropout = config.dropout
+        self.uses_deep_sets = config.model_variant in {"deepsets_only", "fused"}
+        self.uses_global_features = config.model_variant in {"global_mlp", "fused"}
 
-        # 第一层 Deep Sets：边界道路节点聚合为客户集合表示。
-        self.boundary_phi = _MLP(config.boundary_feature_dim, hidden, hidden, dropout)
-        self.boundary_rho = _MLP(3 * hidden, hidden, hidden, dropout)
+        if self.uses_deep_sets:
+            # 第一层 Deep Sets：边界道路节点聚合为客户集合表示。
+            self.boundary_phi: _MLP | None = _MLP(
+                config.boundary_feature_dim, hidden, hidden, dropout
+            )
+            self.boundary_rho: _MLP | None = _MLP(3 * hidden, hidden, hidden, dropout)
 
-        # 基线和候选共用客户、仓库组与分区编码器，避免两个分支学习不一致的坐标系。
-        customer_input = hidden + config.customer_static_dim + config.assignment_feature_dim
-        self.customer_phi = _MLP(customer_input, hidden, hidden, dropout)
-        group_input = 3 * hidden + config.group_feature_dim
-        self.group_rho = _MLP(group_input, hidden, hidden, dropout)
-        self.partition_rho = _MLP(3 * hidden, hidden, hidden, dropout)
+            # 基线和候选共用编码器，避免两个分支学习不一致的表示空间。
+            customer_input = hidden + config.customer_static_dim + config.assignment_feature_dim
+            self.customer_phi: _MLP | None = _MLP(customer_input, hidden, hidden, dropout)
+            group_input = 3 * hidden + config.group_feature_dim
+            self.group_rho: _MLP | None = _MLP(group_input, hidden, hidden, dropout)
+            self.partition_rho: _MLP | None = _MLP(3 * hidden, hidden, hidden, dropout)
+            deep_sets_output_dim = 3 * hidden
+        else:
+            self.boundary_phi = None
+            self.boundary_rho = None
+            self.customer_phi = None
+            self.group_rho = None
+            self.partition_rho = None
+            deep_sets_output_dim = 0
 
-        if config.global_feature_dim:
+        if self.uses_global_features:
+            if config.global_feature_dim <= 0:
+                raise ValueError("global_mlp 或 fused 结构必须提供全局人工特征。")
             self.global_encoder: nn.Module | None = _MLP(
                 config.global_feature_dim, hidden, hidden, dropout
             )
@@ -174,13 +198,13 @@ class HierarchicalDeepSets(nn.Module):
             self.global_encoder = None
             global_output_dim = 0
 
-        decision_input = 3 * hidden + global_output_dim
+        decision_input = deep_sets_output_dim + global_output_dim
         self.decision_encoder = _MLP(decision_input, hidden, hidden, dropout)
         self.regression_head = nn.Linear(hidden, len(REGRESSION_TARGETS))
         self.right_censored_head = nn.Linear(hidden, 1)
         self.cost_feasible_head = nn.Linear(hidden, 1)
-        self.group_log_phase2_head = nn.Linear(hidden, 1)
-        self.group_right_censored_head = nn.Linear(hidden, 1)
+        self.group_log_phase2_head = nn.Linear(hidden, 1) if self.uses_deep_sets else None
+        self.group_right_censored_head = nn.Linear(hidden, 1) if self.uses_deep_sets else None
 
     def _encode_partition(
         self,
@@ -197,6 +221,8 @@ class HierarchicalDeepSets(nn.Module):
 
         输入客户静态/归属特征与客户到组、组到样本的索引；输出逐组表示和逐样本表示。
         """
+        if self.customer_phi is None or self.group_rho is None or self.partition_rho is None:
+            raise RuntimeError("当前消融结构未启用 Deep Sets 编码器。")
         customer_input = torch.cat(
             (customer_set_embeddings, customer_static_features, assignment_features), dim=1
         )
@@ -215,48 +241,64 @@ class HierarchicalDeepSets(nn.Module):
 
         回归正值目标位于 log1p 空间；调用方在生成可读报告时负责执行 expm1 逆变换。
         """
-        boundary_embeddings = self.boundary_phi(batch.boundary_features)
-        customer_set_statistics = segment_statistics(
-            boundary_embeddings,
-            batch.boundary_customer,
-            int(batch.customer_static_features.shape[0]),
-        )
-        customer_set_embeddings = self.boundary_rho(customer_set_statistics)
+        decision_parts: list[Tensor] = []
+        candidate_groups: Tensor | None = None
+        if self.uses_deep_sets:
+            if self.boundary_phi is None or self.boundary_rho is None:
+                raise RuntimeError("Deep Sets 编码器初始化不完整。")
+            boundary_embeddings = self.boundary_phi(batch.boundary_features)
+            customer_set_statistics = segment_statistics(
+                boundary_embeddings,
+                batch.boundary_customer,
+                int(batch.customer_static_features.shape[0]),
+            )
+            customer_set_embeddings = self.boundary_rho(customer_set_statistics)
 
-        _, baseline_partition = self._encode_partition(
-            customer_set_embeddings,
-            batch.customer_static_features,
-            batch.baseline_assignment_features,
-            batch.baseline_customer_group,
-            batch.baseline_group_features,
-            batch.baseline_group_sample,
-            batch.batch_size,
-        )
-        candidate_groups, candidate_partition = self._encode_partition(
-            customer_set_embeddings,
-            batch.customer_static_features,
-            batch.candidate_assignment_features,
-            batch.candidate_customer_group,
-            batch.candidate_group_features,
-            batch.candidate_group_sample,
-            batch.batch_size,
-        )
-
-        decision_parts = [
-            baseline_partition,
-            candidate_partition,
-            candidate_partition - baseline_partition,
-        ]
+            _, baseline_partition = self._encode_partition(
+                customer_set_embeddings,
+                batch.customer_static_features,
+                batch.baseline_assignment_features,
+                batch.baseline_customer_group,
+                batch.baseline_group_features,
+                batch.baseline_group_sample,
+                batch.batch_size,
+            )
+            candidate_groups, candidate_partition = self._encode_partition(
+                customer_set_embeddings,
+                batch.customer_static_features,
+                batch.candidate_assignment_features,
+                batch.candidate_customer_group,
+                batch.candidate_group_features,
+                batch.candidate_group_sample,
+                batch.batch_size,
+            )
+            decision_parts.extend((
+                baseline_partition,
+                candidate_partition,
+                candidate_partition - baseline_partition,
+            ))
         if self.global_encoder is not None:
             decision_parts.append(self.global_encoder(batch.global_features))
         decision_embedding = self.decision_encoder(torch.cat(decision_parts, dim=1))
+
+        if candidate_groups is not None:
+            if self.group_log_phase2_head is None or self.group_right_censored_head is None:
+                raise RuntimeError("分组预测头初始化不完整。")
+            group_log_phase2 = self.group_log_phase2_head(candidate_groups).squeeze(1)
+            group_right_censored = self.group_right_censored_head(candidate_groups).squeeze(1)
+        else:
+            # 纯全局MLP没有仓库组表示；返回可拼接占位量，相关损失在配置中关闭。
+            group_count = int(batch.candidate_group_features.shape[0])
+            differentiable_zero = decision_embedding.sum() * 0.0
+            group_log_phase2 = decision_embedding.new_zeros(group_count) + differentiable_zero
+            group_right_censored = decision_embedding.new_zeros(group_count) + differentiable_zero
 
         return {
             "regression": self.regression_head(decision_embedding),
             "right_censored_logit": self.right_censored_head(decision_embedding).squeeze(1),
             "cost_feasible_logit": self.cost_feasible_head(decision_embedding).squeeze(1),
-            "group_log_phase2": self.group_log_phase2_head(candidate_groups).squeeze(1),
-            "group_right_censored_logit": self.group_right_censored_head(candidate_groups).squeeze(1),
+            "group_log_phase2": group_log_phase2,
+            "group_right_censored_logit": group_right_censored,
         }
 
 
@@ -266,16 +308,23 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1.0)
 
 
-def _pairwise_ranking_loss(outputs: Mapping[str, Tensor], batch: DeepSetBatch) -> Tensor:
+def _pairwise_target_ranking_loss(
+    outputs: Mapping[str, Tensor],
+    batch: DeepSetBatch,
+    target_name: str,
+    extra_eligible: Tensor | None = None,
+) -> Tensor:
     """
-    在同一实例的真实成本可行候选之间计算成对时间排序损失。
+    对同一实例内指定目标计算成对排序损失。
 
-    输入模型输出和批次标签；输出 RankNet 风格损失，时间近似相等的候选不构造比较对。
+    输入模型输出、批次、目标名与可选资格掩码；输出 RankNet 风格损失。
     """
-    predicted = outputs["regression"][:, TARGET_INDEX["downstream_total_seconds"]]
-    actual = batch.targets[:, TARGET_INDEX["downstream_total_seconds"]]
-    exact = batch.target_mask[:, TARGET_INDEX["downstream_total_seconds"]]
-    eligible = exact & batch.cost_feasible_mask & (batch.cost_feasible > 0.5)
+    target_index = TARGET_INDEX[target_name]
+    predicted = outputs["regression"][:, target_index]
+    actual = batch.targets[:, target_index]
+    eligible = batch.target_mask[:, target_index]
+    if extra_eligible is not None:
+        eligible = eligible & extra_eligible
     losses: list[Tensor] = []
     for instance in torch.unique(batch.instance_index):
         indices = torch.nonzero(
@@ -339,7 +388,18 @@ def hierarchical_deepsets_loss(
         ),
         batch.cost_feasible_mask,
     )
-    ranking_loss = _pairwise_ranking_loss(outputs, batch)
+    time_ranking_loss = _pairwise_target_ranking_loss(
+        outputs, batch, "downstream_total_seconds"
+    )
+    cost_ranking_loss = _pairwise_target_ranking_loss(
+        outputs, batch, "cost_change_ratio"
+    )
+    feasible_time_ranking_loss = _pairwise_target_ranking_loss(
+        outputs,
+        batch,
+        "downstream_total_seconds",
+        batch.cost_feasible_mask & (batch.cost_feasible > 0.5),
+    )
 
     # 串行 Phase 2 的分区预测应与各仓库组预测之和一致。
     predicted_group_seconds = torch.expm1(outputs["group_log_phase2"].clamp(max=20.0)).clamp_min(0.0)
@@ -347,7 +407,7 @@ def hierarchical_deepsets_loss(
     predicted_group_sum.scatter_add_(0, batch.candidate_group_sample, predicted_group_seconds)
     predicted_total_log = torch.log1p(predicted_group_sum)
     phase2_index = TARGET_INDEX["phase2_serial_seconds"]
-    consistency_loss = _masked_mean(
+    group_sum_consistency_loss = _masked_mean(
         F.smooth_l1_loss(
             predicted_total_log,
             outputs["regression"][:, phase2_index],
@@ -356,14 +416,39 @@ def hierarchical_deepsets_loss(
         batch.target_mask[:, phase2_index],
     )
 
+    # 下游总时间必须与 Phase 2 和 Phase 3 的预测之和一致，避免独立预测头互相矛盾。
+    phase3_index = TARGET_INDEX["phase3_seconds"]
+    downstream_index = TARGET_INDEX["downstream_total_seconds"]
+    predicted_phase2 = torch.expm1(outputs["regression"][:, phase2_index].clamp(max=20.0))
+    predicted_phase3 = torch.expm1(outputs["regression"][:, phase3_index].clamp(max=20.0))
+    predicted_downstream_from_parts = torch.log1p(
+        predicted_phase2.clamp_min(0.0) + predicted_phase3.clamp_min(0.0)
+    )
+    downstream_mask = (
+        batch.target_mask[:, phase2_index]
+        & batch.target_mask[:, phase3_index]
+        & batch.target_mask[:, downstream_index]
+    )
+    downstream_consistency_loss = _masked_mean(
+        F.smooth_l1_loss(
+            predicted_downstream_from_parts,
+            outputs["regression"][:, downstream_index],
+            reduction="none",
+        ),
+        downstream_mask,
+    )
+
     components = {
         "regression": regression_loss,
         "group_time": group_time_loss,
         "right_censored": right_censored_loss,
         "group_right_censored": group_right_censored_loss,
         "cost_feasible": cost_feasible_loss,
-        "ranking": ranking_loss,
-        "sum_consistency": consistency_loss,
+        "time_ranking": time_ranking_loss,
+        "cost_ranking": cost_ranking_loss,
+        "feasible_time_ranking": feasible_time_ranking_loss,
+        "group_sum_consistency": group_sum_consistency_loss,
+        "downstream_consistency": downstream_consistency_loss,
     }
     total = (
         weights.regression * regression_loss
@@ -371,8 +456,11 @@ def hierarchical_deepsets_loss(
         + weights.right_censored * right_censored_loss
         + weights.group_right_censored * group_right_censored_loss
         + weights.cost_feasible * cost_feasible_loss
-        + weights.ranking * ranking_loss
-        + weights.sum_consistency * consistency_loss
+        + weights.time_ranking * time_ranking_loss
+        + weights.cost_ranking * cost_ranking_loss
+        + weights.feasible_time_ranking * feasible_time_ranking_loss
+        + weights.group_sum_consistency * group_sum_consistency_loss
+        + weights.downstream_consistency * downstream_consistency_loss
     )
     return total, components
 

@@ -11,7 +11,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.partition_learning.deep_sets import DeepSetsLossConfig  # noqa: E402
+from src.partition_learning.deep_sets import (  # noqa: E402
+    DeepSetsLossConfig,
+    MODEL_VARIANTS,
+)
+from src.partition_learning.deep_sets_ablation import run_ablation_suite  # noqa: E402
 from src.partition_learning.deep_sets_data import (  # noqa: E402
     build_deepsets_cache,
     load_deepsets_cache,
@@ -35,8 +39,7 @@ def parse_arguments() -> argparse.Namespace:
         "--records",
         type=Path,
         nargs="+",
-        required=True,
-        help="一个或多个 candidate_records.jsonl，目录输入会自动寻找候选文件。",
+        help="构造新缓存时提供一个或多个candidate_records.jsonl；复用缓存时可省略。",
     )
     parser.add_argument(
         "--result-root",
@@ -54,6 +57,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--cost-limit", type=float, default=0.10)
     parser.add_argument("--distance-batch-size", type=int, default=128)
     parser.add_argument("--random-seed", type=int, default=260915)
+    parser.add_argument("--validation-fraction", type=float, default=0.20)
     parser.add_argument("--test-fraction", type=float, default=0.20)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.10)
@@ -63,6 +67,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--instances-per-batch", type=int, default=2)
     parser.add_argument("--include-method-features", action="store_true")
+    parser.add_argument(
+        "--model-variant",
+        choices=MODEL_VARIANTS,
+        default="fused",
+        help="单模型训练结构；消融模式会依次训练全部结构。",
+    )
+    parser.add_argument(
+        "--ablation-suite",
+        action="store_true",
+        help="运行人工特征、纯Deep Sets、纯全局MLP和融合模型四组公平消融。",
+    )
     parser.add_argument("--device", default="auto", help="auto、cpu或cuda。")
     return parser.parse_args()
 
@@ -90,6 +105,8 @@ def main() -> int:
     if arguments.rebuild_cache or not cache_path.is_file():
         if arguments.result_root is None:
             raise ValueError("首次构造 Deep Sets 缓存时必须提供 --result-root。")
+        if not arguments.records:
+            raise ValueError("首次构造 Deep Sets 缓存时必须提供 --records。")
         record_paths = [_resolve_record_path(path.resolve()) for path in arguments.records]
         records = deduplicate_candidate_records([
             row for path in record_paths for row in read_jsonl(path)
@@ -110,6 +127,7 @@ def main() -> int:
 
     training_config = DeepSetsTrainingConfig(
         random_seed=arguments.random_seed,
+        validation_fraction=arguments.validation_fraction,
         test_fraction=arguments.test_fraction,
         hidden_dim=arguments.hidden_dim,
         dropout=arguments.dropout,
@@ -119,8 +137,23 @@ def main() -> int:
         patience=arguments.patience,
         instances_per_batch=arguments.instances_per_batch,
         include_method_features=arguments.include_method_features,
+        model_variant=arguments.model_variant,
         device=arguments.device,
     )
+    if arguments.ablation_suite:
+        report = run_ablation_suite(
+            cache,
+            output_dir / "ablation",
+            training_config=training_config,
+            loss_config=DeepSetsLossConfig(),
+        )
+        print(
+            f"四组消融完成：{output_dir / 'ablation' / 'ablation_report.json'}，"
+            f"模型数={len(report['models'])}",
+            flush=True,
+        )
+        return 0
+
     _, report = train_deepsets(
         cache,
         output_dir / "model",
@@ -128,7 +161,7 @@ def main() -> int:
         loss_config=DeepSetsLossConfig(),
     )
     print(
-        f"Deep Sets 训练完成：best_epoch={report['best_epoch']}，"
+        f"{arguments.model_variant} 训练完成：best_epoch={report['best_epoch']}，"
         f"模型={output_dir / 'model' / 'deepsets_model.pt'}",
         flush=True,
     )
