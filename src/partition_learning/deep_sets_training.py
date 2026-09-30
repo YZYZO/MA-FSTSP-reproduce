@@ -219,6 +219,71 @@ def _joint_policy_metrics(
     }
 
 
+def _probability_constrained_policy_metrics(
+    actual_time: np.ndarray,
+    actual_cost: np.ndarray,
+    predicted_time_score: np.ndarray,
+    feasible_probability: np.ndarray,
+    instance_ids: np.ndarray,
+    candidate_names: np.ndarray,
+    *,
+    cost_limit: float,
+    probability_threshold: float,
+) -> dict[str, float | int]:
+    """
+    使用成本可行概率筛选候选，并按独立时间排序分数选择方案。
+
+    输入真实时间/成本、排序分数、可行概率和实例信息；输出成本违规、时间后悔
+    及相对MST节省，用于评价双头模型的实际决策质量。
+    """
+    violations, regrets, selected_savings, oracle_savings = [], [], [], []
+    fallback_count = 0
+    for instance_id in np.unique(instance_ids):
+        indices = np.flatnonzero(instance_ids == instance_id)
+        true_feasible = indices[actual_cost[indices] <= cost_limit]
+        if len(true_feasible) == 0:
+            continue
+        predicted_feasible = indices[
+            feasible_probability[indices] >= probability_threshold
+        ]
+        if len(predicted_feasible):
+            selected = int(predicted_feasible[
+                np.argmin(predicted_time_score[predicted_feasible])
+            ])
+        else:
+            # 无候选达到安全阈值时选择可行概率最高者，避免任意回退。
+            selected = int(indices[np.argmax(feasible_probability[indices])])
+            fallback_count += 1
+        oracle = int(true_feasible[np.argmin(actual_time[true_feasible])])
+        stays = indices[candidate_names[indices] == "stay"]
+        if len(stays) == 0:
+            continue
+        baseline = max(float(actual_time[int(stays[0])]), 1e-9)
+        violation = bool(actual_cost[selected] > cost_limit)
+        violations.append(violation)
+        if not violation:
+            best = max(float(actual_time[oracle]), 1e-9)
+            regrets.append(max(0.0, (float(actual_time[selected]) - best) / best))
+        selected_savings.append((baseline - float(actual_time[selected])) / baseline)
+        oracle_savings.append((baseline - float(actual_time[oracle])) / baseline)
+    return {
+        "cost_limit": float(cost_limit),
+        "probability_threshold": float(probability_threshold),
+        "instance_count": len(violations),
+        "fallback_count": int(fallback_count),
+        "true_cost_violation_fraction": float(np.mean(violations)) if violations else 0.0,
+        "feasible_selection_count": len(regrets),
+        "mean_feasible_time_regret_ratio": float(np.mean(regrets)) if regrets else 0.0,
+        "median_feasible_time_regret_ratio": float(np.median(regrets)) if regrets else 0.0,
+        "mean_selected_time_saving_vs_mst": (
+            float(np.mean(selected_savings)) if selected_savings else 0.0
+        ),
+        "mean_oracle_time_saving_vs_mst": (
+            float(np.mean(oracle_savings)) if oracle_savings else 0.0
+        ),
+    }
+
+
 def evaluate_candidate_predictions(
     actual: np.ndarray,
     predicted: np.ndarray,
@@ -281,6 +346,7 @@ def evaluate_deepsets(
     candidate_names: list[str] = []
     group_predicted, group_actual, group_mask = [], [], []
     group_censored_probability, group_censored_actual = [], []
+    ranking_rows: list[np.ndarray] = []
 
     for batch in loader:
         device_batch = batch.to(device)
@@ -302,6 +368,8 @@ def evaluate_deepsets(
             torch.sigmoid(outputs["group_right_censored_logit"]).cpu().numpy()
         )
         group_censored_actual.append(device_batch.group_right_censored.cpu().numpy())
+        if "ranking_scores" in outputs:
+            ranking_rows.append(outputs["ranking_scores"].cpu().numpy())
 
     predicted = np.concatenate(predicted_rows)
     actual = np.concatenate(actual_rows)
@@ -325,6 +393,41 @@ def evaluate_deepsets(
     report["cost_feasible"] = _classification_metrics(
         feasible_y[feasible_valid], feasible_p[feasible_valid]
     )
+
+    if ranking_rows:
+        ranking_scores = np.concatenate(ranking_rows)
+        time_index = TARGET_INDEX["downstream_total_seconds"]
+        cost_index = TARGET_INDEX["cost_change_ratio"]
+        final_cost_index = TARGET_INDEX["final_cost"]
+        time_valid = masks[:, time_index]
+        cost_valid = masks[:, cost_index]
+        final_cost_valid = masks[:, final_cost_index]
+        report["ranking_heads"] = {
+            "downstream_total_seconds": _within_instance_metrics(
+                actual[time_valid, time_index],
+                ranking_scores[time_valid, 0],
+                ids[time_valid],
+            ),
+            "final_cost": _within_instance_metrics(
+                actual[final_cost_valid, final_cost_index],
+                ranking_scores[final_cost_valid, 1],
+                ids[final_cost_valid],
+            ),
+        }
+        joint_valid = time_valid & cost_valid & feasible_valid
+        report["ranking_policy_by_threshold"] = {
+            f"{threshold:.2f}": _probability_constrained_policy_metrics(
+                actual[joint_valid, time_index],
+                actual[joint_valid, cost_index],
+                ranking_scores[joint_valid, 0],
+                feasible_p[joint_valid],
+                ids[joint_valid],
+                names[joint_valid],
+                cost_limit=cost_limit,
+                probability_threshold=threshold,
+            )
+            for threshold in (0.50, 0.70, 0.80, 0.90)
+        }
 
     if model.uses_deep_sets:
         group_valid = np.concatenate(group_mask)

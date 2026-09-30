@@ -101,8 +101,15 @@ class DeepSetsLossConfig:
     time_ranking: float = 0.15
     cost_ranking: float = 0.15
     feasible_time_ranking: float = 0.20
+    within_instance_regression: float = 0.0
+    time_topk_ranking: float = 0.0
+    cost_topk_ranking: float = 0.0
+    feasible_time_topk_ranking: float = 0.0
     group_sum_consistency: float = 0.15
     downstream_consistency: float = 0.15
+    # 不可行候选被模型误判为可行会直接造成成本违规，因此允许提高其分类损失。
+    cost_infeasible_multiplier: float = 1.0
+    topk: int = 3
 
 
 class _MLP(nn.Module):
@@ -320,7 +327,7 @@ def _pairwise_target_ranking_loss(
     输入模型输出、批次、目标名与可选资格掩码；输出 RankNet 风格损失。
     """
     target_index = TARGET_INDEX[target_name]
-    predicted = outputs["regression"][:, target_index]
+    predicted = _ranking_prediction(outputs, target_name)
     actual = batch.targets[:, target_index]
     eligible = batch.target_mask[:, target_index]
     if extra_eligible is not None:
@@ -346,6 +353,97 @@ def _pairwise_target_ranking_loss(
         losses.append(F.softplus(-sign * predicted_difference).mean())
     if not losses:
         return predicted.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def _topk_listwise_ranking_loss(
+    outputs: Mapping[str, Tensor],
+    batch: DeepSetBatch,
+    target_name: str,
+    *,
+    topk: int,
+    extra_eligible: Tensor | None = None,
+) -> Tensor:
+    """
+    对同一实例内真实最优的前K个候选计算列表排序损失。
+
+    输入模型输出、批次、目标名、K值和可选资格掩码；输出以真实顺序为监督的
+    Plackett-Luce负对数似然，使训练更关注最终会被选择的头部候选。
+    """
+    target_index = TARGET_INDEX[target_name]
+    predicted = _ranking_prediction(outputs, target_name)
+    actual = batch.targets[:, target_index]
+    eligible = batch.target_mask[:, target_index]
+    if extra_eligible is not None:
+        eligible = eligible & extra_eligible
+
+    losses: list[Tensor] = []
+    for instance in torch.unique(batch.instance_index):
+        indices = torch.nonzero(
+            (batch.instance_index == instance) & eligible, as_tuple=False
+        ).flatten()
+        if len(indices) < 2:
+            continue
+        actual_order = torch.argsort(actual[indices])
+        predicted_in_true_order = predicted[indices[actual_order]]
+        # 预测值越小越好；取负号后即可使用标准列表选择概率。
+        scores = -predicted_in_true_order
+        rank_count = min(max(int(topk), 1), len(indices) - 1)
+        for rank in range(rank_count):
+            losses.append(torch.logsumexp(scores[rank:], dim=0) - scores[rank])
+    if not losses:
+        return predicted.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def _ranking_prediction(
+    outputs: Mapping[str, Tensor], target_name: str
+) -> Tensor:
+    """
+    输入模型输出和排序目标名，输出用于实例内比较的标量分数。
+
+    双头GNN为总时间和成本变化提供独立排序分数；旧模型继续回退到回归值，
+    因而历史配置和已保存模型不受影响。分数越小表示候选越优。
+    """
+    ranking_scores = outputs.get("ranking_scores")
+    if ranking_scores is not None:
+        if target_name == "downstream_total_seconds":
+            return ranking_scores[:, 0]
+        if target_name == "cost_change_ratio":
+            return ranking_scores[:, 1]
+    return outputs["regression"][:, TARGET_INDEX[target_name]]
+
+
+def _within_instance_regression_loss(
+    outputs: Mapping[str, Tensor],
+    batch: DeepSetBatch,
+) -> Tensor:
+    """
+    约束同一实例内候选相对均值的时间与成本偏差。
+
+    输入预测与批次；输出去除实例整体尺度后的平滑L1损失，避免模型仅依靠
+    50/100/150客户规模差异取得较高R²，却无法区分同一实例的候选划分。
+    """
+    losses: list[Tensor] = []
+    for target_name in ("downstream_total_seconds", "cost_change_ratio"):
+        target_index = TARGET_INDEX[target_name]
+        predicted = outputs["regression"][:, target_index]
+        actual = batch.targets[:, target_index]
+        eligible = batch.target_mask[:, target_index]
+        for instance in torch.unique(batch.instance_index):
+            indices = torch.nonzero(
+                (batch.instance_index == instance) & eligible, as_tuple=False
+            ).flatten()
+            if len(indices) < 2:
+                continue
+            predicted_values = predicted[indices]
+            actual_values = actual[indices]
+            losses.append(F.smooth_l1_loss(
+                predicted_values - predicted_values.mean(),
+                actual_values - actual_values.mean(),
+            ))
+    if not losses:
+        return outputs["regression"].sum() * 0.0
     return torch.stack(losses).mean()
 
 
@@ -382,10 +480,16 @@ def hierarchical_deepsets_loss(
     group_right_censored_loss = F.binary_cross_entropy_with_logits(
         outputs["group_right_censored_logit"], batch.group_right_censored
     )
+    cost_feasible_values = F.binary_cross_entropy_with_logits(
+        outputs["cost_feasible_logit"], batch.cost_feasible, reduction="none"
+    )
+    cost_feasible_weights = torch.where(
+        batch.cost_feasible > 0.5,
+        torch.ones_like(cost_feasible_values),
+        torch.full_like(cost_feasible_values, weights.cost_infeasible_multiplier),
+    )
     cost_feasible_loss = _masked_mean(
-        F.binary_cross_entropy_with_logits(
-            outputs["cost_feasible_logit"], batch.cost_feasible, reduction="none"
-        ),
+        cost_feasible_values * cost_feasible_weights,
         batch.cost_feasible_mask,
     )
     time_ranking_loss = _pairwise_target_ranking_loss(
@@ -399,6 +503,26 @@ def hierarchical_deepsets_loss(
         batch,
         "downstream_total_seconds",
         batch.cost_feasible_mask & (batch.cost_feasible > 0.5),
+    )
+    within_instance_regression_loss = _within_instance_regression_loss(outputs, batch)
+    time_topk_ranking_loss = _topk_listwise_ranking_loss(
+        outputs,
+        batch,
+        "downstream_total_seconds",
+        topk=weights.topk,
+    )
+    cost_topk_ranking_loss = _topk_listwise_ranking_loss(
+        outputs,
+        batch,
+        "cost_change_ratio",
+        topk=weights.topk,
+    )
+    feasible_time_topk_ranking_loss = _topk_listwise_ranking_loss(
+        outputs,
+        batch,
+        "downstream_total_seconds",
+        topk=weights.topk,
+        extra_eligible=batch.cost_feasible_mask & (batch.cost_feasible > 0.5),
     )
 
     # 串行 Phase 2 的分区预测应与各仓库组预测之和一致。
@@ -447,6 +571,10 @@ def hierarchical_deepsets_loss(
         "time_ranking": time_ranking_loss,
         "cost_ranking": cost_ranking_loss,
         "feasible_time_ranking": feasible_time_ranking_loss,
+        "within_instance_regression": within_instance_regression_loss,
+        "time_topk_ranking": time_topk_ranking_loss,
+        "cost_topk_ranking": cost_topk_ranking_loss,
+        "feasible_time_topk_ranking": feasible_time_topk_ranking_loss,
         "group_sum_consistency": group_sum_consistency_loss,
         "downstream_consistency": downstream_consistency_loss,
     }
@@ -459,6 +587,10 @@ def hierarchical_deepsets_loss(
         + weights.time_ranking * time_ranking_loss
         + weights.cost_ranking * cost_ranking_loss
         + weights.feasible_time_ranking * feasible_time_ranking_loss
+        + weights.within_instance_regression * within_instance_regression_loss
+        + weights.time_topk_ranking * time_topk_ranking_loss
+        + weights.cost_topk_ranking * cost_topk_ranking_loss
+        + weights.feasible_time_topk_ranking * feasible_time_topk_ranking_loss
         + weights.group_sum_consistency * group_sum_consistency_loss
         + weights.downstream_consistency * downstream_consistency_loss
     )
