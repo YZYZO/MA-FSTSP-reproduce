@@ -195,6 +195,7 @@ class ThreeRoundExperiment:
         algorithm_instances_per_file: int = 10,
         algorithm_candidates_per_instance: int = 24,
         bootstrap_record_paths: tuple[str | Path, ...] = (),
+        algorithm_instance_manifest: str | Path | None = None,
     ):
         """
         保存输入、输出和统一实验预算。
@@ -217,6 +218,17 @@ class ThreeRoundExperiment:
         self.algorithm_candidates_per_instance = int(algorithm_candidates_per_instance)
         # 既有精确候选可作为新一轮的种子数据，避免重复求解已经完成的实例。
         self.bootstrap_record_paths = tuple(Path(path).resolve() for path in bootstrap_record_paths)
+        self.algorithm_instance_manifest = (
+            Path(algorithm_instance_manifest).resolve()
+            if algorithm_instance_manifest is not None else None
+        )
+        self.algorithm_indices_by_source: dict[str, list[int]] | None = None
+        if self.algorithm_instance_manifest is not None:
+            payload = json.loads(self.algorithm_instance_manifest.read_text(encoding="utf-8"))
+            self.algorithm_indices_by_source = {
+                str(source): list(map(int, indices))
+                for source, indices in payload["indices_by_source"].items()
+            }
         self.execution_files = [
             path for path in self.result_files
             if (self.include_55k or "manhattan_55k" not in path.name)
@@ -274,6 +286,10 @@ class ThreeRoundExperiment:
             "candidate_policy_version": "family_stratified_v1",
             "instance_order": "source_round_robin_v1",
             "bootstrap_record_paths": [str(path) for path in self.bootstrap_record_paths],
+            "algorithm_instance_manifest": (
+                str(self.algorithm_instance_manifest)
+                if self.algorithm_instance_manifest is not None else None
+            ),
             "customer_counts": list(self.customer_counts) if self.customer_counts else None,
             "include_55k": bool(self.include_55k),
             "only_graph": self.only_graph,
@@ -331,6 +347,10 @@ class ThreeRoundExperiment:
                 "candidate_policy_version": "family_stratified_v1",
                 "instance_order": "source_round_robin_v1",
                 "bootstrap_record_paths": [str(path) for path in self.bootstrap_record_paths],
+                "algorithm_instance_manifest": (
+                    str(self.algorithm_instance_manifest)
+                    if self.algorithm_instance_manifest is not None else None
+                ),
                 "algorithm_run_id": self.algorithm_run_id,
                 "evaluator_version": EVALUATOR_VERSION,
             },
@@ -375,6 +395,11 @@ class ThreeRoundExperiment:
         """按文件构造第一轮 24 个或第二轮 80 个历史实例对象。"""
         selected: list[ExperimentInstance] = []
         for path in self.execution_files:
+            if self.algorithm_indices_by_source is not None:
+                indices = self.algorithm_indices_by_source.get(path.stem, [])
+                if indices:
+                    selected.extend(load_instances(path, indices))
+                continue
             with __import__("numpy").load(path, allow_pickle=True) as data:
                 total = int(len(data["instance_indices"]))
             indices = select_instance_indices(total, self.supervised_instances_per_file)
@@ -748,6 +773,12 @@ class ThreeRoundExperiment:
         preferred_by_source = preferred_by_source or {}
         selected_by_source: list[list[ExperimentInstance]] = []
         for path in self.execution_files:
+            # 主动扩充清单是显式实验范围，不能再用默认的每文件配额补齐。
+            if self.algorithm_indices_by_source is not None:
+                indices = self.algorithm_indices_by_source.get(path.stem, [])
+                if indices:
+                    selected_by_source.append(load_instances(path, indices))
+                continue
             with __import__("numpy").load(path, allow_pickle=True) as data:
                 total = int(len(data["instance_indices"]))
             indices = _quota_indices(

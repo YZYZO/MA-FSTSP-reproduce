@@ -107,6 +107,12 @@ class DeepSetsLossConfig:
     feasible_time_topk_ranking: float = 0.0
     group_sum_consistency: float = 0.15
     downstream_consistency: float = 0.15
+    time_quantile: float = 0.0
+    group_time_quantile: float = 0.0
+    censored_time_lower_bound: float = 0.0
+    group_censored_time_lower_bound: float = 0.0
+    # cost_change_ratio与final_cost信息部分重复，可降低前者权重避免比例噪声支配训练。
+    cost_change_regression_weight: float = 1.0
     # 不可行候选被模型误判为可行会直接造成成本违规，因此允许提高其分类损失。
     cost_infeasible_multiplier: float = 1.0
     topk: int = 3
@@ -315,6 +321,12 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1.0)
 
 
+def _pinball_loss(predicted: Tensor, actual: Tensor, quantile: float) -> Tensor:
+    """输入预测值、真实值和分位数，输出逐项分位数回归损失。"""
+    error = actual - predicted
+    return torch.maximum(quantile * error, (quantile - 1.0) * error)
+
+
 def _pairwise_target_ranking_loss(
     outputs: Mapping[str, Tensor],
     batch: DeepSetBatch,
@@ -466,7 +478,13 @@ def hierarchical_deepsets_loss(
         regression_targets.append(_masked_mean(
             regression_values[:, target_index], batch.target_mask[:, target_index]
         ))
-    regression_loss = torch.stack(regression_targets).mean()
+    regression_target_weights = outputs["regression"].new_ones(len(regression_targets))
+    regression_target_weights[TARGET_INDEX["cost_change_ratio"]] = (
+        weights.cost_change_regression_weight
+    )
+    regression_loss = (
+        torch.stack(regression_targets) * regression_target_weights
+    ).sum() / regression_target_weights.sum().clamp_min(1.0)
 
     group_time_loss = _masked_mean(
         F.smooth_l1_loss(
@@ -562,6 +580,56 @@ def hierarchical_deepsets_loss(
         downstream_mask,
     )
 
+    # 单次求解样本也可跨候选学习条件分位数；精确样本训练P50/P90，删失样本仅提供下界。
+    time_quantiles = outputs.get("time_quantiles")
+    group_time_quantiles = outputs.get("group_time_quantiles")
+    if time_quantiles is None:
+        time_quantile_loss = outputs["regression"].sum() * 0.0
+        censored_time_lower_bound_loss = time_quantile_loss
+    else:
+        exact_time = batch.target_mask[:, downstream_index] & (batch.right_censored < 0.5)
+        time_quantile_loss = 0.5 * (
+            _masked_mean(
+                _pinball_loss(
+                    time_quantiles[:, 0], batch.targets[:, downstream_index], 0.50
+                ),
+                exact_time,
+            )
+            + _masked_mean(
+                _pinball_loss(
+                    time_quantiles[:, 1], batch.targets[:, downstream_index], 0.90
+                ),
+                exact_time,
+            )
+        )
+        censored_time_lower_bound_loss = _masked_mean(
+            F.relu(batch.targets[:, downstream_index] - time_quantiles[:, 1]),
+            batch.right_censored > 0.5,
+        )
+    if group_time_quantiles is None:
+        group_time_quantile_loss = outputs["group_log_phase2"].sum() * 0.0
+        group_censored_time_lower_bound_loss = group_time_quantile_loss
+    else:
+        exact_group_time = batch.group_time_mask & (batch.group_right_censored < 0.5)
+        group_time_quantile_loss = 0.5 * (
+            _masked_mean(
+                _pinball_loss(
+                    group_time_quantiles[:, 0], batch.group_log_phase2, 0.50
+                ),
+                exact_group_time,
+            )
+            + _masked_mean(
+                _pinball_loss(
+                    group_time_quantiles[:, 1], batch.group_log_phase2, 0.90
+                ),
+                exact_group_time,
+            )
+        )
+        group_censored_time_lower_bound_loss = _masked_mean(
+            F.relu(batch.group_log_phase2 - group_time_quantiles[:, 1]),
+            batch.group_right_censored > 0.5,
+        )
+
     components = {
         "regression": regression_loss,
         "group_time": group_time_loss,
@@ -577,6 +645,10 @@ def hierarchical_deepsets_loss(
         "feasible_time_topk_ranking": feasible_time_topk_ranking_loss,
         "group_sum_consistency": group_sum_consistency_loss,
         "downstream_consistency": downstream_consistency_loss,
+        "time_quantile": time_quantile_loss,
+        "group_time_quantile": group_time_quantile_loss,
+        "censored_time_lower_bound": censored_time_lower_bound_loss,
+        "group_censored_time_lower_bound": group_censored_time_lower_bound_loss,
     }
     total = (
         weights.regression * regression_loss
@@ -593,6 +665,10 @@ def hierarchical_deepsets_loss(
         + weights.feasible_time_topk_ranking * feasible_time_topk_ranking_loss
         + weights.group_sum_consistency * group_sum_consistency_loss
         + weights.downstream_consistency * downstream_consistency_loss
+        + weights.time_quantile * time_quantile_loss
+        + weights.group_time_quantile * group_time_quantile_loss
+        + weights.censored_time_lower_bound * censored_time_lower_bound_loss
+        + weights.group_censored_time_lower_bound * group_censored_time_lower_bound_loss
     )
     return total, components
 

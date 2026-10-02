@@ -11,79 +11,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.partition_learning.deep_sets import DeepSetsLossConfig  # noqa: E402
 from src.partition_learning.deep_sets_data import load_deepsets_cache  # noqa: E402
-from src.partition_learning.gnn import GNN_MODEL_VARIANTS  # noqa: E402
+from src.partition_learning.gnn import GNN_MODEL_VARIANTS, MESSAGE_OPERATORS  # noqa: E402
 from src.partition_learning.gnn_data import (  # noqa: E402
     build_partition_gnn_cache,
     load_partition_gnn_cache,
 )
 from src.partition_learning.gnn_training import (  # noqa: E402
     PartitionGNNTrainingConfig,
+    partition_loss_profile,
     run_partition_gnn_ablation,
     train_partition_gnn,
 )
 
 
-def build_loss_config(profile: str) -> DeepSetsLossConfig:
+def build_loss_config(profile: str):
     """
     输入损失配置名称，输出对应的多任务权重。
 
     balanced保持历史实验设置；selection加强实例内相对预测、Top-3排序以及
     成本不可行候选的识别，用于直接改善候选选择质量。
     """
-    if profile == "balanced":
-        return DeepSetsLossConfig()
-    if profile == "selection":
-        return DeepSetsLossConfig(
-            group_time=0.30,
-            cost_feasible=0.45,
-            time_ranking=0.25,
-            cost_ranking=0.30,
-            feasible_time_ranking=0.35,
-            within_instance_regression=0.35,
-            time_topk_ranking=0.15,
-            cost_topk_ranking=0.20,
-            feasible_time_topk_ranking=0.25,
-            group_sum_consistency=0.10,
-            downstream_consistency=0.10,
-            cost_infeasible_multiplier=2.5,
-            topk=3,
-        )
-    if profile == "dual_head":
-        return DeepSetsLossConfig(
-            group_time=0.35,
-            cost_feasible=0.45,
-            time_ranking=0.25,
-            cost_ranking=0.30,
-            feasible_time_ranking=0.35,
-            within_instance_regression=0.10,
-            time_topk_ranking=0.15,
-            cost_topk_ranking=0.20,
-            feasible_time_topk_ranking=0.25,
-            group_sum_consistency=0.15,
-            downstream_consistency=0.15,
-            cost_infeasible_multiplier=2.5,
-            topk=3,
-        )
-    if profile == "dual_head_topk":
-        return DeepSetsLossConfig(
-            regression=0.50,
-            group_time=0.20,
-            cost_feasible=0.45,
-            time_ranking=0.20,
-            cost_ranking=0.20,
-            feasible_time_ranking=0.25,
-            within_instance_regression=0.0,
-            time_topk_ranking=0.60,
-            cost_topk_ranking=0.45,
-            feasible_time_topk_ranking=0.60,
-            group_sum_consistency=0.10,
-            downstream_consistency=0.10,
-            cost_infeasible_multiplier=2.5,
-            topk=3,
-        )
-    raise ValueError(f"未知损失配置：{profile}")
+    return partition_loss_profile(profile)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -116,6 +65,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--test-fraction", type=float, default=0.20)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--message-layers", type=int, default=2)
+    parser.add_argument("--message-operator", choices=MESSAGE_OPERATORS, default="edge_mlp")
     parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -124,7 +74,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--instances-per-batch", type=int, default=2)
     parser.add_argument(
         "--loss-profile",
-        choices=("balanced", "selection", "dual_head", "dual_head_topk"),
+        choices=(
+            "balanced", "selection", "dual_head", "dual_head_topk",
+            "quantile_only", "target_weighted", "robust_targets",
+        ),
         default="balanced",
         help=(
             "balanced复现实验；selection加强候选选择；dual_head配合独立排序头；"
@@ -195,6 +148,7 @@ def main() -> int:
         test_fraction=arguments.test_fraction,
         hidden_dim=arguments.hidden_dim,
         message_layers=arguments.message_layers,
+        message_operator=arguments.message_operator,
         dropout=arguments.dropout,
         learning_rate=arguments.learning_rate,
         weight_decay=arguments.weight_decay,

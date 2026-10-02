@@ -46,6 +46,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--algorithm-instances-per-file", type=int, default=10)
     parser.add_argument("--algorithm-candidates-per-instance", type=int, default=24)
     parser.add_argument(
+        "--instance-indices-manifest",
+        type=Path,
+        help="仅运行清单中指定的新实例下标，用于监督模型主动扩充。",
+    )
+    parser.add_argument(
         "--bootstrap-records",
         type=Path,
         nargs="*",
@@ -96,6 +101,7 @@ def main() -> int:
         algorithm_instances_per_file=arguments.algorithm_instances_per_file,
         algorithm_candidates_per_instance=arguments.algorithm_candidates_per_instance,
         bootstrap_record_paths=tuple(arguments.bootstrap_records),
+        algorithm_instance_manifest=arguments.instance_indices_manifest,
     )
     if arguments.round == "oracle":
         experiment.run_oracle()

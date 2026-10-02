@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .deep_sets import DeepSetsLossConfig
+from .deep_sets import DeepSetsLossConfig, inverse_regression_targets
 from .deep_sets_data import (
     DeepSetsCandidateDataset,
     InstanceBatchSampler,
@@ -27,9 +27,165 @@ from .deep_sets_training import (
     _seed_everything,
     evaluate_deepsets,
 )
-from .gnn import GNN_MODEL_VARIANTS, PartitionGNNConfig, PartitionPerformanceGNN
+from .gnn import (
+    GNN_MODEL_VARIANTS,
+    MESSAGE_OPERATORS,
+    PartitionGNNConfig,
+    PartitionPerformanceGNN,
+)
 from .gnn_data import collate_partition_graphs
 from .models import TARGET_INDEX
+
+
+def partition_loss_profile(profile: str) -> DeepSetsLossConfig:
+    """
+    输入损失配置名称，输出候选划分GNN的多任务损失权重。
+
+    balanced用于绝对数值预测；selection强调安全选择；dual_head系列用于
+    独立排序头，并保留完整配置到训练报告中以支持交叉验证复现。
+    """
+    if profile == "balanced":
+        return DeepSetsLossConfig()
+    if profile == "selection":
+        return DeepSetsLossConfig(
+            group_time=0.30,
+            cost_feasible=0.45,
+            time_ranking=0.25,
+            cost_ranking=0.30,
+            feasible_time_ranking=0.35,
+            within_instance_regression=0.35,
+            time_topk_ranking=0.15,
+            cost_topk_ranking=0.20,
+            feasible_time_topk_ranking=0.25,
+            group_sum_consistency=0.10,
+            downstream_consistency=0.10,
+            cost_infeasible_multiplier=2.5,
+            topk=3,
+        )
+    if profile == "dual_head":
+        return DeepSetsLossConfig(
+            group_time=0.35,
+            cost_feasible=0.45,
+            time_ranking=0.25,
+            cost_ranking=0.30,
+            feasible_time_ranking=0.35,
+            within_instance_regression=0.10,
+            time_topk_ranking=0.15,
+            cost_topk_ranking=0.20,
+            feasible_time_topk_ranking=0.25,
+            group_sum_consistency=0.15,
+            downstream_consistency=0.15,
+            cost_infeasible_multiplier=2.5,
+            topk=3,
+        )
+    if profile == "dual_head_topk":
+        return DeepSetsLossConfig(
+            regression=0.50,
+            group_time=0.20,
+            cost_feasible=0.45,
+            time_ranking=0.20,
+            cost_ranking=0.20,
+            feasible_time_ranking=0.25,
+            within_instance_regression=0.0,
+            time_topk_ranking=0.60,
+            cost_topk_ranking=0.45,
+            feasible_time_topk_ranking=0.60,
+            group_sum_consistency=0.10,
+            downstream_consistency=0.10,
+            cost_infeasible_multiplier=2.5,
+            topk=3,
+        )
+    if profile == "robust_targets":
+        return DeepSetsLossConfig(
+            group_time=0.35,
+            right_censored=0.25,
+            group_right_censored=0.20,
+            cost_feasible=0.45,
+            time_ranking=0.25,
+            cost_ranking=0.30,
+            feasible_time_ranking=0.35,
+            within_instance_regression=0.10,
+            time_topk_ranking=0.20,
+            cost_topk_ranking=0.20,
+            feasible_time_topk_ranking=0.25,
+            group_sum_consistency=0.15,
+            downstream_consistency=0.15,
+            time_quantile=0.25,
+            group_time_quantile=0.15,
+            censored_time_lower_bound=0.30,
+            group_censored_time_lower_bound=0.20,
+            cost_change_regression_weight=0.25,
+            cost_infeasible_multiplier=2.5,
+            topk=3,
+        )
+    if profile == "quantile_only":
+        return DeepSetsLossConfig(
+            time_quantile=0.25,
+            group_time_quantile=0.15,
+            censored_time_lower_bound=0.30,
+            group_censored_time_lower_bound=0.20,
+        )
+    if profile == "target_weighted":
+        return DeepSetsLossConfig(
+            group_time=0.35,
+            cost_feasible=0.45,
+            time_ranking=0.25,
+            cost_ranking=0.30,
+            feasible_time_ranking=0.35,
+            within_instance_regression=0.10,
+            time_topk_ranking=0.20,
+            cost_topk_ranking=0.20,
+            feasible_time_topk_ranking=0.25,
+            group_sum_consistency=0.15,
+            downstream_consistency=0.15,
+            cost_change_regression_weight=0.25,
+            cost_infeasible_multiplier=2.5,
+            topk=3,
+        )
+    raise ValueError(f"未知损失配置：{profile}")
+
+
+def stratified_instance_folds(
+    cache: dict[str, Any],
+    *,
+    fold_count: int = 5,
+    random_seed: int = 260930,
+) -> tuple[InstanceSplit, ...]:
+    """
+    按路网和客户规模生成实例级分层交叉验证切分。
+
+    输入GNN缓存、折数和随机种子；输出每折互斥的训练/验证/测试实例。
+    第i折作为测试集，第i+1折作为验证集，其余折作为训练集，确保候选不会跨折泄漏。
+    """
+    import random
+
+    if fold_count < 3:
+        raise ValueError("交叉验证至少需要3折，以分别构造训练、验证和测试集。")
+    strata: dict[tuple[str, int], list[str]] = {}
+    for instance_id, static in cache["instances"].items():
+        key = (str(static["graph_name"]), int(static["customer_count"]))
+        strata.setdefault(key, []).append(str(instance_id))
+
+    fold_ids: list[set[str]] = [set() for _ in range(fold_count)]
+    generator = random.Random(random_seed)
+    for key in sorted(strata):
+        ordered = sorted(strata[key])
+        generator.shuffle(ordered)
+        for index, instance_id in enumerate(ordered):
+            fold_ids[index % fold_count].add(instance_id)
+
+    all_ids = set(cache["instances"])
+    splits = []
+    for fold_index in range(fold_count):
+        test_ids = fold_ids[fold_index]
+        validation_ids = fold_ids[(fold_index + 1) % fold_count]
+        train_ids = all_ids - test_ids - validation_ids
+        splits.append(InstanceSplit(
+            train_ids=tuple(sorted(train_ids)),
+            validation_ids=tuple(sorted(validation_ids)),
+            test_ids=tuple(sorted(test_ids)),
+        ))
+    return tuple(splits)
 
 
 @dataclass(frozen=True)
@@ -49,6 +205,8 @@ class PartitionGNNTrainingConfig:
     instances_per_batch: int = 2
     model_variant: str = "gnn_fused"
     separate_ranking_heads: bool = False
+    time_quantile_heads: bool = False
+    message_operator: str = "edge_mlp"
     warm_start_checkpoint: str | None = None
     train_selection_heads_only: bool = False
     device: str = "auto"
@@ -148,6 +306,8 @@ def train_partition_gnn(
     losses = loss_config or DeepSetsLossConfig()
     if config.model_variant not in GNN_MODEL_VARIANTS:
         raise ValueError(f"未知GNN结构：{config.model_variant}")
+    if config.message_operator not in MESSAGE_OPERATORS:
+        raise ValueError(f"未知道路消息算子：{config.message_operator}")
     _seed_everything(config.random_seed)
     device = _resolve_device(config.device)
     split = instance_split or split_instance_ids_three_way(
@@ -208,6 +368,8 @@ def train_partition_gnn(
         dropout=config.dropout,
         model_variant=config.model_variant,
         separate_ranking_heads=config.separate_ranking_heads,
+        time_quantile_heads=config.time_quantile_heads,
+        message_operator=config.message_operator,
     )
     model = PartitionPerformanceGNN(model_config).to(device)
     warm_start_report: dict[str, list[str]] | None = None
@@ -386,3 +548,72 @@ def load_partition_gnn_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
+
+
+@torch.no_grad()
+def predict_partition_gnn(
+    cache: dict[str, Any],
+    checkpoint_path: str | Path,
+    instance_ids: tuple[str, ...] | list[str],
+    *,
+    instances_per_batch: int = 2,
+) -> dict[str, np.ndarray]:
+    """
+    使用已保存GNN对指定实例的全部缓存候选执行逐候选推理。
+
+    输入缓存、检查点和实例编号；输出真实标签、回归预测、排序分数、分类概率及
+    候选标识。该结果用于折外误差分析、模型集成和不确定性估计。
+    """
+    model, checkpoint = load_partition_gnn_model(checkpoint_path)
+    feature_indices = np.asarray(checkpoint["global_feature_indices"], dtype=np.int64)
+    dataset = DeepSetsCandidateDataset(
+        cache,
+        instance_ids,
+        feature_indices,
+        np.asarray(checkpoint["global_feature_mean"], dtype=np.float32),
+        np.asarray(checkpoint["global_feature_scale"], dtype=np.float32),
+    )
+    _, loader = _build_loader(
+        dataset,
+        instances_per_batch=instances_per_batch,
+        shuffle=False,
+        random_seed=0,
+    )
+    predicted_rows, actual_rows, mask_rows, ranking_rows = [], [], [], []
+    time_quantile_rows: list[np.ndarray] = []
+    feasible_rows, censored_rows = [], []
+    output_instance_ids: list[str] = []
+    candidate_names: list[str] = []
+    for batch in loader:
+        outputs = model(batch)
+        predicted_rows.append(
+            inverse_regression_targets(outputs["regression"]).cpu().numpy()
+        )
+        actual_rows.append(inverse_regression_targets(batch.targets).cpu().numpy())
+        mask_rows.append(batch.target_mask.cpu().numpy())
+        ranking_rows.append(outputs["ranking_scores"].cpu().numpy())
+        if "time_quantiles" in outputs:
+            time_quantile_rows.append(
+                torch.expm1(outputs["time_quantiles"]).clamp_min(0).cpu().numpy()
+            )
+        feasible_rows.append(
+            torch.sigmoid(outputs["cost_feasible_logit"]).cpu().numpy()
+        )
+        censored_rows.append(
+            torch.sigmoid(outputs["right_censored_logit"]).cpu().numpy()
+        )
+        output_instance_ids.extend(batch.instance_ids)
+        candidate_names.extend(batch.candidate_names)
+    result = {
+        "predicted": np.concatenate(predicted_rows),
+        "actual": np.concatenate(actual_rows),
+        "target_mask": np.concatenate(mask_rows),
+        "ranking_scores": np.concatenate(ranking_rows),
+        "cost_feasible_probability": np.concatenate(feasible_rows),
+        "right_censored_probability": np.concatenate(censored_rows),
+        "instance_ids": np.asarray(output_instance_ids),
+        "candidate_names": np.asarray(candidate_names),
+    }
+    if time_quantile_rows:
+        result["time_quantiles"] = np.concatenate(time_quantile_rows)
+    return result

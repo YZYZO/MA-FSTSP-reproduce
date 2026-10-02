@@ -13,6 +13,7 @@ from .models import REGRESSION_TARGETS, TARGET_INDEX
 
 
 GNN_MODEL_VARIANTS = ("gnn_only", "gnn_fused")
+MESSAGE_OPERATORS = ("edge_mlp", "edge_attention", "multiscale")
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,8 @@ class PartitionGNNConfig:
     dropout: float = 0.10
     model_variant: str = "gnn_fused"
     separate_ranking_heads: bool = False
+    time_quantile_heads: bool = False
+    message_operator: str = "edge_mlp"
 
 
 class DirectedPartitionGraphLayer(nn.Module):
@@ -41,13 +44,24 @@ class DirectedPartitionGraphLayer(nn.Module):
         road_edge_dim: int,
         assignment_dim: int,
         dropout: float,
+        message_operator: str = "edge_mlp",
     ):
         super().__init__()
+        if message_operator not in MESSAGE_OPERATORS:
+            raise ValueError(f"未知道路消息算子：{message_operator}")
         hidden = hidden_dim
+        self.message_operator = message_operator
         # 道路消息显式读取源/目标表示、道路边属性及候选同组标志。
         self.road_message = _MLP(
             2 * hidden + road_edge_dim + 1, hidden, hidden, dropout
         )
+        self.road_attention = nn.Sequential(
+            _MLP(2 * hidden + road_edge_dim + 1, hidden, hidden, dropout),
+            nn.Linear(hidden, 1),
+        ) if message_operator in {"edge_attention", "multiscale"} else None
+        self.multiscale_fusion = _MLP(
+            6 * hidden, 3 * hidden, 3 * hidden, dropout
+        ) if message_operator == "multiscale" else None
         self.customer_to_group = _MLP(
             hidden + assignment_dim, hidden, hidden, dropout
         )
@@ -59,6 +73,31 @@ class DirectedPartitionGraphLayer(nn.Module):
         self.customer_norm = nn.LayerNorm(hidden)
         self.group_norm = nn.LayerNorm(hidden)
         self.dropout = nn.Dropout(dropout)
+
+    def _attention_context(
+        self,
+        edge_inputs: Tensor,
+        road_messages: Tensor,
+        target: Tensor,
+        customer_count: int,
+    ) -> Tensor:
+        """输入道路边表示，按目标客户执行数值稳定的边注意力聚合。"""
+        assert self.road_attention is not None
+        logits = self.road_attention(edge_inputs).squeeze(1)
+        maxima = logits.new_full((customer_count,), float("-inf"))
+        maxima.scatter_reduce_(0, target, logits, reduce="amax", include_self=True)
+        weights = torch.exp(logits - maxima[target])
+        denominators = logits.new_zeros(customer_count)
+        denominators.scatter_add_(0, target, weights)
+        weights = weights / denominators[target].clamp_min(1e-9)
+        attended = road_messages.new_zeros((customer_count, road_messages.shape[1]))
+        attended.scatter_add_(
+            0,
+            target[:, None].expand_as(road_messages),
+            road_messages * weights[:, None],
+        )
+        # 保持与sum/mean/max统计相同的三倍宽度，使不同算子的其余参数可公平比较。
+        return torch.cat((attended, attended, attended), dim=1)
 
     def forward(
         self,
@@ -78,13 +117,27 @@ class DirectedPartitionGraphLayer(nn.Module):
         same_group = (customer_group[source] == customer_group[target]).to(
             customers.dtype
         )[:, None]
-        road_messages = self.road_message(torch.cat((
+        edge_inputs = torch.cat((
             customers[source],
             customers[target],
             road_edge_features,
             same_group,
-        ), dim=1))
-        road_context = segment_statistics(road_messages, target, len(customers))
+        ), dim=1)
+        road_messages = self.road_message(edge_inputs)
+        statistics_context = segment_statistics(road_messages, target, len(customers))
+        if self.message_operator == "edge_mlp":
+            road_context = statistics_context
+        else:
+            attention_context = self._attention_context(
+                edge_inputs, road_messages, target, len(customers)
+            )
+            if self.message_operator == "edge_attention":
+                road_context = attention_context
+            else:
+                assert self.multiscale_fusion is not None
+                road_context = self.multiscale_fusion(torch.cat((
+                    statistics_context, attention_context,
+                ), dim=1))
 
         group_messages = self.customer_to_group(torch.cat((
             customers, assignment_features,
@@ -136,6 +189,7 @@ class PartitionPerformanceGNN(nn.Module):
                 config.road_edge_feature_dim,
                 config.assignment_feature_dim,
                 dropout,
+                config.message_operator,
             )
             for _ in range(config.message_layers)
         ])
@@ -162,6 +216,13 @@ class PartitionPerformanceGNN(nn.Module):
         self.cost_feasible_head = nn.Linear(hidden, 1)
         self.group_log_phase2_head = nn.Linear(hidden, 1)
         self.group_right_censored_head = nn.Linear(hidden, 1)
+        # 分位数头输出P50与非负增量，保证P90始终不小于P50。
+        self.time_quantile_head = (
+            nn.Linear(hidden, 2) if config.time_quantile_heads else None
+        )
+        self.group_time_quantile_head = (
+            nn.Linear(hidden, 2) if config.time_quantile_heads else None
+        )
 
     def _encode_partition(
         self,
@@ -234,7 +295,7 @@ class PartitionPerformanceGNN(nn.Module):
                 regression[:, TARGET_INDEX["cost_change_ratio"]],
             ), dim=1)
         )
-        return {
+        outputs = {
             "regression": regression,
             "ranking_scores": ranking_scores,
             "right_censored_logit": self.right_censored_head(decision).squeeze(1),
@@ -244,3 +305,19 @@ class PartitionPerformanceGNN(nn.Module):
                 candidate_groups
             ).squeeze(1),
         }
+        if self.time_quantile_head is not None and self.group_time_quantile_head is not None:
+            raw_time_quantiles = self.time_quantile_head(decision)
+            raw_group_quantiles = self.group_time_quantile_head(candidate_groups)
+            outputs["time_quantiles"] = torch.stack((
+                raw_time_quantiles[:, 0],
+                raw_time_quantiles[:, 0] + torch.nn.functional.softplus(
+                    raw_time_quantiles[:, 1]
+                ),
+            ), dim=1)
+            outputs["group_time_quantiles"] = torch.stack((
+                raw_group_quantiles[:, 0],
+                raw_group_quantiles[:, 0] + torch.nn.functional.softplus(
+                    raw_group_quantiles[:, 1]
+                ),
+            ), dim=1)
+        return outputs

@@ -347,6 +347,8 @@ def evaluate_deepsets(
     group_predicted, group_actual, group_mask = [], [], []
     group_censored_probability, group_censored_actual = [], []
     ranking_rows: list[np.ndarray] = []
+    time_quantile_rows: list[np.ndarray] = []
+    group_time_quantile_rows: list[np.ndarray] = []
 
     for batch in loader:
         device_batch = batch.to(device)
@@ -370,6 +372,14 @@ def evaluate_deepsets(
         group_censored_actual.append(device_batch.group_right_censored.cpu().numpy())
         if "ranking_scores" in outputs:
             ranking_rows.append(outputs["ranking_scores"].cpu().numpy())
+        if "time_quantiles" in outputs:
+            time_quantile_rows.append(
+                torch.expm1(outputs["time_quantiles"]).clamp_min(0).cpu().numpy()
+            )
+        if "group_time_quantiles" in outputs:
+            group_time_quantile_rows.append(
+                torch.expm1(outputs["group_time_quantiles"]).clamp_min(0).cpu().numpy()
+            )
 
     predicted = np.concatenate(predicted_rows)
     actual = np.concatenate(actual_rows)
@@ -393,6 +403,23 @@ def evaluate_deepsets(
     report["cost_feasible"] = _classification_metrics(
         feasible_y[feasible_valid], feasible_p[feasible_valid]
     )
+
+    if time_quantile_rows:
+        time_quantiles = np.concatenate(time_quantile_rows)
+        downstream_index = TARGET_INDEX["downstream_total_seconds"]
+        exact = masks[:, downstream_index] & (censor_y < 0.5)
+        censored = censor_y > 0.5
+        report["downstream_time_quantiles"] = {
+            "p50_mae_exact": float(np.mean(np.abs(
+                time_quantiles[exact, 0] - actual[exact, downstream_index]
+            ))) if np.any(exact) else float("nan"),
+            "p90_coverage_exact": float(np.mean(
+                actual[exact, downstream_index] <= time_quantiles[exact, 1]
+            )) if np.any(exact) else float("nan"),
+            "p90_censored_lower_bound_satisfaction": float(np.mean(
+                time_quantiles[censored, 1] >= actual[censored, downstream_index]
+            )) if np.any(censored) else float("nan"),
+        }
 
     if ranking_rows:
         ranking_scores = np.concatenate(ranking_rows)
@@ -441,6 +468,21 @@ def evaluate_deepsets(
         report["group_right_censored"] = _classification_metrics(
             group_censor_y, group_censor_p
         )
+        if group_time_quantile_rows:
+            group_quantiles = np.concatenate(group_time_quantile_rows)
+            exact_group = group_valid & (group_censor_y < 0.5)
+            censored_group = group_censor_y > 0.5
+            report["group_time_quantiles"] = {
+                "p50_mae_exact": float(np.mean(np.abs(
+                    group_quantiles[exact_group, 0] - group_y[exact_group]
+                ))) if np.any(exact_group) else float("nan"),
+                "p90_coverage_exact": float(np.mean(
+                    group_y[exact_group] <= group_quantiles[exact_group, 1]
+                )) if np.any(exact_group) else float("nan"),
+                "p90_censored_lower_bound_satisfaction": float(np.mean(
+                    group_quantiles[censored_group, 1] >= group_y[censored_group]
+                )) if np.any(censored_group) else float("nan"),
+            }
     return report
 
 

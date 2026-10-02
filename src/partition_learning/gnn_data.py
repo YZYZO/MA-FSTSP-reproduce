@@ -191,6 +191,46 @@ def load_partition_gnn_cache(path: str | Path) -> dict[str, Any]:
         return torch.load(Path(path), map_location="cpu")
 
 
+def subsample_partition_gnn_cache(
+    cache: dict[str, Any],
+    output_path: str | Path,
+    *,
+    k_neighbors: int,
+) -> dict[str, Any]:
+    """
+    从较密的客户道路近邻图无损抽取较小k的出向/入向近邻缓存。
+
+    输入已有GNN缓存、输出路径和目标k；输出保留相同标签与候选、仅减少道路边的新缓存。
+    第一维道路边特征是单调变换后的正向距离，因此排序与原始构图完全一致。
+    """
+    source_k = int(cache["k_neighbors"])
+    if k_neighbors > source_k:
+        raise ValueError("子采样目标k不能大于源缓存k。")
+    instances: dict[str, dict[str, Any]] = {}
+    for instance_id, static in cache["instances"].items():
+        edge_index = np.asarray(static["road_edge_index"], dtype=np.int64)
+        edge_features = np.asarray(static["road_edge_features"], dtype=np.float32)
+        source, target = edge_index
+        customer_count = int(static["customer_count"])
+        keep: set[int] = set()
+        for customer in range(customer_count):
+            outgoing = np.flatnonzero(source == customer)
+            incoming = np.flatnonzero(target == customer)
+            keep.update(outgoing[np.argsort(edge_features[outgoing, 0])[:k_neighbors]].tolist())
+            keep.update(incoming[np.argsort(edge_features[incoming, 0])[:k_neighbors]].tolist())
+        selected = np.asarray(sorted(keep), dtype=np.int64)
+        instances[instance_id] = {
+            **static,
+            "road_edge_index": edge_index[:, selected],
+            "road_edge_features": edge_features[selected],
+        }
+    result = {**cache, "k_neighbors": int(k_neighbors), "instances": instances}
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(result, path)
+    return result
+
+
 def collate_partition_graphs(samples: Sequence[dict[str, Any]]) -> PartitionGraphBatch:
     """
     把不同实例的候选道路图打包为一个批次。
