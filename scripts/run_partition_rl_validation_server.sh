@@ -13,7 +13,29 @@ LOG_PATH="${OUTPUT_DIR}/rl_true_validation.log"
 
 mkdir -p "${OUTPUT_DIR}"
 cd "${PROJECT_ROOT}"
-test -f "${CANDIDATES}"
+
+# 启动前明确检查本轮新增代码和候选文件，避免 set -e 静默退出。
+required_files=(
+  "${PROJECT_ROOT}/scripts/run_partition_rl_validation.py"
+  "${PROJECT_ROOT}/src/partition_learning/rl_validation.py"
+  "${CANDIDATES}"
+)
+missing_files=()
+for required_file in "${required_files[@]}"; do
+  if [[ ! -f "${required_file}" ]]; then
+    missing_files+=("${required_file}")
+  fi
+done
+if (( ${#missing_files[@]} > 0 )); then
+  echo "缺少RL真实复核所需文件：" >&2
+  printf '  - %s\n' "${missing_files[@]}" >&2
+  echo "请把本地 partition_rl_validation_server_bundle.tar.gz 上传并在项目根目录解压。" >&2
+  exit 2
+fi
+
+echo "候选文件：${CANDIDATES}"
+echo "求解上限：${SOLVER_TIME_LIMIT} 秒/仓库组"
+echo "准备启动RL真实复核……"
 
 nohup "${PYTHON_BIN}" scripts/run_partition_rl_validation.py \
   --candidates "${CANDIDATES}" \
