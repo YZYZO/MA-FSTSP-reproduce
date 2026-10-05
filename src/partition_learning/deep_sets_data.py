@@ -16,9 +16,13 @@ from torch import Tensor
 from torch.utils.data import Dataset, Sampler
 
 from .dataset import ExperimentInstance, load_instances
-from .deep_sets import DeepSetBatch, POSITIVE_TARGET_INDICES
+from .deep_sets import (
+    COST_FEASIBILITY_THRESHOLDS,
+    DeepSetBatch,
+    POSITIVE_TARGET_INDICES,
+)
 from .features import group_variable_proxy
-from .models import REGRESSION_TARGETS
+from .models import REGRESSION_TARGETS, TARGET_INDEX
 from .reporting import deduplicate_partition_records
 from .road import (
     DroneDistanceMatrix,
@@ -598,6 +602,12 @@ class DeepSetsCandidateDataset(Dataset):
                 record["global_features"][self.feature_indices] - self.feature_mean
             ) / self.feature_scale,
             "targets": targets,
+            # 由相对成本连续标签即时派生，旧版缓存无需重建即可训练多阈值风险头。
+            "cost_feasible_thresholds": np.asarray([
+                float(record["targets_raw"][TARGET_INDEX["cost_change_ratio"]])
+                <= threshold
+                for threshold in COST_FEASIBILITY_THRESHOLDS
+            ], dtype=np.float32),
         }
 
 
@@ -652,7 +662,8 @@ def collate_deepsets(samples: Sequence[dict[str, Any]]) -> DeepSetBatch:
     baseline_group_features, candidate_group_features = [], []
     baseline_group_sample, candidate_group_sample = [], []
     targets, target_masks, global_features = [], [], []
-    right_censored, cost_feasible, cost_feasible_masks = [], [], []
+    right_censored, cost_feasible, cost_feasible_thresholds = [], [], []
+    cost_feasible_masks = []
     group_log_phase2, group_time_masks, group_right_censored = [], [], []
     instance_ids = {instance_id: index for index, instance_id in enumerate(sorted({
         sample["instance_id"] for sample in samples
@@ -677,6 +688,7 @@ def collate_deepsets(samples: Sequence[dict[str, Any]]) -> DeepSetBatch:
         global_features.append(sample["global_features"])
         right_censored.append(sample["right_censored"])
         cost_feasible.append(sample["cost_feasible"])
+        cost_feasible_thresholds.append(sample["cost_feasible_thresholds"])
         cost_feasible_masks.append(sample["cost_feasible_mask"])
         group_log_phase2.append(sample["group_log_phase2"])
         group_time_masks.append(sample["group_time_mask"])
@@ -705,6 +717,9 @@ def collate_deepsets(samples: Sequence[dict[str, Any]]) -> DeepSetBatch:
         target_mask=torch.as_tensor(np.stack(target_masks), dtype=torch.bool),
         right_censored=torch.as_tensor(right_censored, dtype=torch.float32),
         cost_feasible=torch.as_tensor(cost_feasible, dtype=torch.float32),
+        cost_feasible_thresholds=torch.as_tensor(
+            np.stack(cost_feasible_thresholds), dtype=torch.float32
+        ),
         cost_feasible_mask=torch.as_tensor(cost_feasible_masks, dtype=torch.bool),
         group_log_phase2=torch.as_tensor(np.concatenate(group_log_phase2), dtype=torch.float32),
         group_time_mask=torch.as_tensor(np.concatenate(group_time_masks), dtype=torch.bool),

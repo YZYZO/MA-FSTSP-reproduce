@@ -28,36 +28,43 @@ def combine_surrogate_outputs(
     numeric_prediction = numeric["prediction"]
     ranking_prediction = ranking["prediction"]
     risk_prediction = risk["prediction"]
+    prediction = {
+        # balanced 数值头作为强化学习奖励和约束的主要点预测。
+        "phase2_serial_seconds": numeric_prediction["phase2_serial_seconds"],
+        "phase3_seconds": numeric_prediction["phase3_seconds"],
+        "downstream_total_seconds": numeric_prediction["downstream_total_seconds"],
+        "final_cost": numeric_prediction["final_cost"],
+        "time_saving_ratio": numeric_prediction["time_saving_ratio"],
+        "cost_change_ratio": numeric_prediction["cost_change_ratio"],
+        # target-weighted 头只承担同一实例内部的候选排序。
+        "time_rank_score": ranking_prediction["time_rank_score"],
+        "cost_rank_score": ranking_prediction["cost_rank_score"],
+        "cost_feasible_probability": ranking_prediction[
+            "cost_feasible_probability"
+        ],
+        # robust 头提供风险信号，不替代主点预测。
+        "downstream_time_p50": risk_prediction.get(
+            "downstream_time_p50",
+            risk_prediction["downstream_total_seconds"],
+        ),
+        "downstream_time_p90": risk_prediction.get(
+            "downstream_time_p90",
+            risk_prediction["downstream_total_seconds"],
+        ),
+        "right_censored_probability": risk_prediction[
+            "right_censored_probability"
+        ],
+    }
+    # 新版风险模型补充多档硬约束概率和成本上界；旧部署包仍可无缝加载。
+    for name, value in risk_prediction.items():
+        if name.startswith("cost_feasible_probability_") or name in {
+            "cost_change_p50", "cost_change_p90"
+        }:
+            prediction[name] = value
     return {
         "candidate_name": numeric["candidate_name"],
         "partition": numeric["partition"],
-        "prediction": {
-            # balanced 数值头作为强化学习奖励和约束的主要点预测。
-            "phase2_serial_seconds": numeric_prediction["phase2_serial_seconds"],
-            "phase3_seconds": numeric_prediction["phase3_seconds"],
-            "downstream_total_seconds": numeric_prediction["downstream_total_seconds"],
-            "final_cost": numeric_prediction["final_cost"],
-            "time_saving_ratio": numeric_prediction["time_saving_ratio"],
-            "cost_change_ratio": numeric_prediction["cost_change_ratio"],
-            # target-weighted 头只承担同一实例内部的候选排序。
-            "time_rank_score": ranking_prediction["time_rank_score"],
-            "cost_rank_score": ranking_prediction["cost_rank_score"],
-            "cost_feasible_probability": ranking_prediction[
-                "cost_feasible_probability"
-            ],
-            # robust 头提供风险信号，不替代主点预测。
-            "downstream_time_p50": risk_prediction.get(
-                "downstream_time_p50",
-                risk_prediction["downstream_total_seconds"],
-            ),
-            "downstream_time_p90": risk_prediction.get(
-                "downstream_time_p90",
-                risk_prediction["downstream_total_seconds"],
-            ),
-            "right_censored_probability": risk_prediction[
-                "right_censored_probability"
-            ],
-        },
+        "prediction": prediction,
         "uncertainty": {
             "numeric": numeric["uncertainty"],
             "ranking": ranking["uncertainty"],

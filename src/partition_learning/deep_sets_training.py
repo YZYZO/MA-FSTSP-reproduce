@@ -17,6 +17,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .deep_sets import (
+    COST_FEASIBILITY_NAMES,
     DeepSetsLossConfig,
     DeepSetsModelConfig,
     HierarchicalDeepSets,
@@ -349,6 +350,9 @@ def evaluate_deepsets(
     ranking_rows: list[np.ndarray] = []
     time_quantile_rows: list[np.ndarray] = []
     group_time_quantile_rows: list[np.ndarray] = []
+    cost_threshold_probability_rows: list[np.ndarray] = []
+    cost_threshold_actual_rows: list[np.ndarray] = []
+    cost_quantile_rows: list[np.ndarray] = []
 
     for batch in loader:
         device_batch = batch.to(device)
@@ -380,6 +384,15 @@ def evaluate_deepsets(
             group_time_quantile_rows.append(
                 torch.expm1(outputs["group_time_quantiles"]).clamp_min(0).cpu().numpy()
             )
+        if "cost_feasible_threshold_logits" in outputs:
+            cost_threshold_probability_rows.append(
+                torch.sigmoid(outputs["cost_feasible_threshold_logits"]).cpu().numpy()
+            )
+            cost_threshold_actual_rows.append(
+                device_batch.cost_feasible_thresholds.cpu().numpy()
+            )
+        if "cost_change_quantiles" in outputs:
+            cost_quantile_rows.append(outputs["cost_change_quantiles"].cpu().numpy())
 
     predicted = np.concatenate(predicted_rows)
     actual = np.concatenate(actual_rows)
@@ -403,6 +416,32 @@ def evaluate_deepsets(
     report["cost_feasible"] = _classification_metrics(
         feasible_y[feasible_valid], feasible_p[feasible_valid]
     )
+    if cost_threshold_probability_rows:
+        threshold_probability = np.concatenate(cost_threshold_probability_rows)
+        threshold_actual = np.concatenate(cost_threshold_actual_rows)
+        report["cost_feasible_by_limit"] = {
+            name: _classification_metrics(
+                threshold_actual[feasible_valid, index],
+                threshold_probability[feasible_valid, index],
+            )
+            for index, name in enumerate(COST_FEASIBILITY_NAMES)
+        }
+
+    if cost_quantile_rows:
+        cost_quantiles = np.concatenate(cost_quantile_rows)
+        cost_index = TARGET_INDEX["cost_change_ratio"]
+        cost_valid = masks[:, cost_index]
+        report["cost_change_quantiles"] = {
+            "p50_mae": float(np.mean(np.abs(
+                cost_quantiles[cost_valid, 0] - actual[cost_valid, cost_index]
+            ))) if np.any(cost_valid) else float("nan"),
+            "p90_coverage": float(np.mean(
+                actual[cost_valid, cost_index] <= cost_quantiles[cost_valid, 1]
+            )) if np.any(cost_valid) else float("nan"),
+            "mean_p90_minus_p50": float(np.mean(
+                cost_quantiles[cost_valid, 1] - cost_quantiles[cost_valid, 0]
+            )) if np.any(cost_valid) else float("nan"),
+        }
 
     if time_quantile_rows:
         time_quantiles = np.concatenate(time_quantile_rows)

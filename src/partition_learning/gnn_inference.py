@@ -15,7 +15,7 @@ from .candidates import (
     moved_customer_count,
 )
 from .dataset import load_instances
-from .deep_sets import inverse_regression_targets
+from .deep_sets import COST_FEASIBILITY_NAMES, inverse_regression_targets
 from .deep_sets_data import _partition_features, _static_instance_tensors
 from .features import action_delta_features
 from .gnn_data import collate_partition_graphs
@@ -120,6 +120,9 @@ class PartitionGNNPredictor:
             "target_mask": np.zeros(len(REGRESSION_TARGETS), dtype=bool),
             "right_censored": 0.0,
             "cost_feasible": 0.0,
+            "cost_feasible_thresholds": np.zeros(
+                len(COST_FEASIBILITY_NAMES), dtype=np.float32
+            ),
             "cost_feasible_mask": False,
             "group_log_phase2": np.zeros(depot_count, dtype=np.float32),
             "group_time_mask": np.zeros(depot_count, dtype=bool),
@@ -158,10 +161,19 @@ class PartitionGNNPredictor:
             regression = inverse_regression_targets(outputs["regression"]).cpu().numpy()
             ranking = outputs["ranking_scores"].cpu().numpy()
             feasible = torch.sigmoid(outputs["cost_feasible_logit"]).cpu().numpy()
+            threshold_probabilities = None
+            if "cost_feasible_threshold_logits" in outputs:
+                threshold_probabilities = torch.sigmoid(
+                    outputs["cost_feasible_threshold_logits"]
+                ).cpu().numpy()
             censored = torch.sigmoid(outputs["right_censored_logit"]).cpu().numpy()
             quantiles = None
             if "time_quantiles" in outputs:
                 quantiles = torch.expm1(outputs["time_quantiles"]).clamp_min(0).cpu().numpy()
+            cost_quantiles = (
+                outputs["cost_change_quantiles"].cpu().numpy()
+                if "cost_change_quantiles" in outputs else None
+            )
             member = []
             for index in range(len(candidates)):
                 item: dict[str, Any] = {
@@ -177,6 +189,16 @@ class PartitionGNNPredictor:
                 if quantiles is not None:
                     item["downstream_time_p50"] = float(quantiles[index, 0])
                     item["downstream_time_p90"] = float(quantiles[index, 1])
+                if threshold_probabilities is not None:
+                    for threshold_index, threshold_name in enumerate(
+                        COST_FEASIBILITY_NAMES
+                    ):
+                        item[f"cost_feasible_probability_{threshold_name}"] = float(
+                            threshold_probabilities[index, threshold_index]
+                        )
+                if cost_quantiles is not None:
+                    item["cost_change_p50"] = float(cost_quantiles[index, 0])
+                    item["cost_change_p90"] = float(cost_quantiles[index, 1])
                 member.append(item)
             member_outputs.append(member)
 

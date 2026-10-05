@@ -193,6 +193,8 @@ class SurrogatePartitionEnvironment:
             tuple[tuple[int, ...], ...],
             dict[str, Any],
         ] = {}
+        # 公平搜索实验按新增的唯一代理预测计费，缓存命中不重复消耗查询预算。
+        self.surrogate_query_count = 0
         self.current = self.baseline
         self.current_prediction: dict[str, Any] | None = None
         self.current_score = 0.0
@@ -552,12 +554,14 @@ class SurrogatePartitionEnvironment:
         actions: list[PartitionRLAction],
     ) -> list[dict[str, Any]]:
         """批量查询未缓存动作并按动作顺序返回统一代理预测。"""
-        missing_actions = [
-            action
-            for action in actions
-            if partition_key(action.partition, self.depots)
-            not in self.prediction_cache
-        ]
+        missing_by_key: dict[
+            tuple[tuple[int, ...], ...], PartitionRLAction
+        ] = {}
+        for action in actions:
+            key = partition_key(action.partition, self.depots)
+            if key not in self.prediction_cache:
+                missing_by_key.setdefault(key, action)
+        missing_actions = list(missing_by_key.values())
         if missing_actions:
             outputs = self.bundle.predict_many(
                 [action.partition for action in missing_actions],
@@ -572,10 +576,53 @@ class SurrogatePartitionEnvironment:
                 self.prediction_cache[
                     partition_key(action.partition, self.depots)
                 ] = output
+            self.surrogate_query_count += len(missing_actions)
         return [
             self.prediction_cache[partition_key(action.partition, self.depots)]
             for action in actions
         ]
+
+    def reset_query_budget(self, *, clear_cache: bool = True) -> None:
+        """重置代理查询计数；可选清空缓存以隔离不同搜索算法的预算。"""
+        self.surrogate_query_count = 0
+        if clear_cache:
+            self.prediction_cache.clear()
+
+    def uncached_action_count(self, actions: list[PartitionRLAction]) -> int:
+        """输入动作列表，输出其中尚未缓存的唯一划分数量。"""
+        keys = {
+            partition_key(action.partition, self.depots)
+            for action in actions
+            if partition_key(action.partition, self.depots)
+            not in self.prediction_cache
+        }
+        return len(keys)
+
+    def set_search_state(
+        self,
+        partition: Partition,
+        *,
+        step_index: int,
+        visited_partition_keys: Iterable[tuple[tuple[int, ...], ...]],
+    ) -> None:
+        """
+        把环境切换到搜索树中的任意节点。
+
+        输入完整划分、深度和该路径已访问划分；更新当前预测与分数，供束搜索等
+        非单轨迹算法复用动作生成逻辑。调用前应先reset以建立MST参照值。
+        """
+        self.current = partition
+        self.step_index = int(step_index)
+        self.visited_partition_keys = set(visited_partition_keys)
+        action = PartitionRLAction(
+            name="search_state",
+            kind="active",
+            partition=partition,
+            features=np.zeros(len(ACTION_FEATURE_NAMES), dtype=np.float32),
+            description="恢复搜索节点",
+        )
+        self.current_prediction = self._predict_many([action])[0]
+        self.current_score = self.score_components(self.current_prediction)["total"]
 
     def score_components(self, output: dict[str, Any]) -> dict[str, float]:
         """把统一代理输出转换成时间、成本、不确定性和超时风险分量。"""

@@ -38,6 +38,7 @@ class ValidationCandidate:
     surrogate_score_improvement: float | None
     surrogate_prediction: dict[str, float]
     surrogate_uncertainty: dict[str, float]
+    metadata: dict[str, Any]
 
 
 def _generator_family(name: str) -> str:
@@ -82,6 +83,7 @@ def parse_validation_candidates(
             "surrogate_score_improvement": 0.0,
             "surrogate_prediction": {},
             "surrogate_uncertainty": {},
+            "subset_metadata": {},
             "partition": {str(key): list(value) for key, value in baseline.items()},
         })
 
@@ -142,6 +144,7 @@ def parse_validation_candidates(
                 str(key): float(value)
                 for key, value in row.get("surrogate_uncertainty", {}).items()
             },
+            metadata=dict(row.get("subset_metadata", {})),
         ))
     parsed.sort(key=lambda item: item.candidate.name != "mst")
     return parsed
@@ -355,6 +358,7 @@ def _acquisition(specification: ValidationCandidate) -> dict[str, Any]:
         "surrogate_score_improvement": specification.surrogate_score_improvement,
         "surrogate_prediction": specification.surrogate_prediction,
         "surrogate_uncertainty": specification.surrogate_uncertainty,
+        "candidate_metadata": specification.metadata,
     }
 
 
@@ -439,6 +443,7 @@ def build_validation_report(
                     None if predicted_cost is None else float(predicted_cost) - true_cost
                 ),
                 "right_censored_groups": int(labels["right_censored_groups"]),
+                "candidate_metadata": acquisition.get("candidate_metadata", {}),
             }
             rows.append(row)
             score = acquisition.get("surrogate_score")
@@ -453,6 +458,24 @@ def build_validation_report(
             (row for row in rows if row["candidate_name"] == "ppo_best"),
             None,
         )
+        feasible_rows = [
+            row for row in rows
+            if row["candidate_exact"]
+            and row["true_cost_change_ratio"] <= cost_limit
+        ]
+        feasible_improved = [
+            row for row in feasible_rows
+            if row["candidate_name"] != "mst"
+            and row["true_time_saving_ratio"] > 0.0
+        ]
+        best_feasible = min(
+            feasible_rows,
+            key=lambda row: (
+                row["true_downstream_total_seconds"],
+                row["candidate_name"],
+            ),
+            default=None,
+        )
         instances[instance_id] = {
             "candidate_count": len(rows),
             "exact_candidate_count": sum(row["candidate_exact"] for row in rows),
@@ -463,6 +486,17 @@ def build_validation_report(
             "cost_prediction_mae": float(np.mean(cost_errors)) if cost_errors else None,
             "ppo_best_verdict": (
                 ppo_row["verification_status"] if ppo_row else "missing"
+            ),
+            "hard_constraint_success": bool(feasible_improved),
+            "feasible_improved_candidates": [
+                row["candidate_name"] for row in feasible_improved
+            ],
+            "best_feasible_candidate": (
+                best_feasible["candidate_name"] if best_feasible else None
+            ),
+            "best_feasible_time_saving_ratio": (
+                best_feasible["true_time_saving_ratio"]
+                if best_feasible else None
             ),
             "candidates": rows,
         }
@@ -487,6 +521,10 @@ def validation_report_markdown(report: dict[str, Any]) -> str:
             "",
             f"- 精确候选：{summary['exact_candidate_count']}/{summary['candidate_count']}",
             f"- PPO最佳候选结论：`{summary['ppo_best_verdict']}`",
+            f"- 10%硬约束阶段成功：`{summary['hard_constraint_success']}`",
+            "- 成本可行且时间改善的候选："
+            f"{summary['feasible_improved_candidates']}",
+            f"- 最佳可行候选：`{summary['best_feasible_candidate']}`",
             f"- 代理分数与真实时间 Spearman：{summary['surrogate_true_time_spearman']}",
             f"- 时间预测 MAE（秒）：{summary['time_prediction_mae_seconds']}",
             f"- 成本预测 MAE：{summary['cost_prediction_mae']}",

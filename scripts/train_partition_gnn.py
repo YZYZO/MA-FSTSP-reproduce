@@ -90,6 +90,11 @@ def parse_arguments() -> argparse.Namespace:
         help="为总时间和成本变化启用独立排序头，避免排序损失扭曲回归值。",
     )
     parser.add_argument(
+        "--cost-risk-heads",
+        action="store_true",
+        help="启用0/5/7/10%成本可行分类头以及成本P50/P90分位数头。",
+    )
+    parser.add_argument(
         "--warm-start-checkpoint",
         type=Path,
         help="从已有GNN模型加载编码器和预测头参数。",
@@ -157,6 +162,12 @@ def main() -> int:
         instances_per_batch=arguments.instances_per_batch,
         model_variant=arguments.model_variant,
         separate_ranking_heads=arguments.separate_ranking_heads,
+        time_quantile_heads=arguments.loss_profile in {
+            "quantile_only", "robust_targets"
+        },
+        cost_risk_heads=(
+            arguments.cost_risk_heads or arguments.loss_profile == "robust_targets"
+        ),
         warm_start_checkpoint=(
             str(arguments.warm_start_checkpoint.resolve())
             if arguments.warm_start_checkpoint is not None

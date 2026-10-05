@@ -101,6 +101,7 @@ def partition_loss_profile(profile: str) -> DeepSetsLossConfig:
             right_censored=0.25,
             group_right_censored=0.20,
             cost_feasible=0.45,
+            cost_feasible_thresholds=0.45,
             time_ranking=0.25,
             cost_ranking=0.30,
             feasible_time_ranking=0.35,
@@ -112,6 +113,7 @@ def partition_loss_profile(profile: str) -> DeepSetsLossConfig:
             downstream_consistency=0.15,
             time_quantile=0.25,
             group_time_quantile=0.15,
+            cost_quantile=0.30,
             censored_time_lower_bound=0.30,
             group_censored_time_lower_bound=0.20,
             cost_change_regression_weight=0.25,
@@ -206,6 +208,7 @@ class PartitionGNNTrainingConfig:
     model_variant: str = "gnn_fused"
     separate_ranking_heads: bool = False
     time_quantile_heads: bool = False
+    cost_risk_heads: bool = False
     message_operator: str = "edge_mlp"
     warm_start_checkpoint: str | None = None
     train_selection_heads_only: bool = False
@@ -260,7 +263,14 @@ def _configure_trainable_parameters(
             parameter.requires_grad_(False)
         if model.ranking_head is None:
             raise ValueError("仅训练选择头时必须启用独立排序头。")
-        for module in (model.ranking_head, model.cost_feasible_head):
+        for module in (
+            model.ranking_head,
+            model.cost_feasible_head,
+            model.cost_threshold_head,
+            model.cost_quantile_head,
+        ):
+            if module is None:
+                continue
             for parameter in module.parameters():
                 parameter.requires_grad_(True)
     return [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -369,6 +379,7 @@ def train_partition_gnn(
         model_variant=config.model_variant,
         separate_ranking_heads=config.separate_ranking_heads,
         time_quantile_heads=config.time_quantile_heads,
+        cost_risk_heads=config.cost_risk_heads,
         message_operator=config.message_operator,
     )
     model = PartitionPerformanceGNN(model_config).to(device)
@@ -581,6 +592,8 @@ def predict_partition_gnn(
     )
     predicted_rows, actual_rows, mask_rows, ranking_rows = [], [], [], []
     time_quantile_rows: list[np.ndarray] = []
+    cost_quantile_rows: list[np.ndarray] = []
+    cost_threshold_rows: list[np.ndarray] = []
     feasible_rows, censored_rows = [], []
     output_instance_ids: list[str] = []
     candidate_names: list[str] = []
@@ -595,6 +608,12 @@ def predict_partition_gnn(
         if "time_quantiles" in outputs:
             time_quantile_rows.append(
                 torch.expm1(outputs["time_quantiles"]).clamp_min(0).cpu().numpy()
+            )
+        if "cost_change_quantiles" in outputs:
+            cost_quantile_rows.append(outputs["cost_change_quantiles"].cpu().numpy())
+        if "cost_feasible_threshold_logits" in outputs:
+            cost_threshold_rows.append(
+                torch.sigmoid(outputs["cost_feasible_threshold_logits"]).cpu().numpy()
             )
         feasible_rows.append(
             torch.sigmoid(outputs["cost_feasible_logit"]).cpu().numpy()
@@ -616,4 +635,10 @@ def predict_partition_gnn(
     }
     if time_quantile_rows:
         result["time_quantiles"] = np.concatenate(time_quantile_rows)
+    if cost_quantile_rows:
+        result["cost_change_quantiles"] = np.concatenate(cost_quantile_rows)
+    if cost_threshold_rows:
+        result["cost_feasible_threshold_probability"] = np.concatenate(
+            cost_threshold_rows
+        )
     return result

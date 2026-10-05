@@ -36,7 +36,9 @@ SUMMARY_METRIC_NAMES = (
     "time_r2", "time_spearman", "time_top3", "time_regret",
     "cost_r2", "cost_spearman", "cost_top3", "cost_regret",
     "policy_threshold", "cost_violation", "feasible_time_regret",
-    "time_saving_vs_mst",
+    "time_saving_vs_mst", "cost_p90_coverage",
+    "cost_feasible_5pct_brier", "cost_feasible_7pct_brier",
+    "cost_feasible_10pct_brier",
 )
 
 
@@ -110,6 +112,8 @@ def _metric_summary(report: dict[str, Any]) -> dict[str, float]:
     else:
         policy = evaluation["joint_policy"]
         policy_threshold = float("nan")
+    cost_quantiles = evaluation.get("cost_change_quantiles", {})
+    cost_thresholds = evaluation.get("cost_feasible_by_limit", {})
     return {
         "time_r2": float(time_regression["r2"]),
         "time_spearman": float(time_ranking["mean_within_instance_spearman"]),
@@ -123,6 +127,16 @@ def _metric_summary(report: dict[str, Any]) -> dict[str, float]:
         "cost_violation": float(policy["true_cost_violation_fraction"]),
         "feasible_time_regret": float(policy["mean_feasible_time_regret_ratio"]),
         "time_saving_vs_mst": float(policy["mean_selected_time_saving_vs_mst"]),
+        "cost_p90_coverage": float(cost_quantiles.get("p90_coverage", float("nan"))),
+        "cost_feasible_5pct_brier": float(
+            cost_thresholds.get("5pct", {}).get("brier", float("nan"))
+        ),
+        "cost_feasible_7pct_brier": float(
+            cost_thresholds.get("7pct", {}).get("brier", float("nan"))
+        ),
+        "cost_feasible_10pct_brier": float(
+            cost_thresholds.get("10pct", {}).get("brier", float("nan"))
+        ),
     }
 
 
@@ -296,6 +310,7 @@ def main() -> int:
                         common,
                         separate_ranking_heads=True,
                         time_quantile_heads=True,
+                        cost_risk_heads=True,
                     )
                     loss_profile = "robust_targets"
                 report = _train_or_resume(

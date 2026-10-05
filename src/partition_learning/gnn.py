@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from .deep_sets import _MLP, segment_statistics
+from .deep_sets import COST_FEASIBILITY_THRESHOLDS, _MLP, segment_statistics
 from .gnn_data import PartitionGraphBatch
 from .models import REGRESSION_TARGETS, TARGET_INDEX
 
@@ -32,7 +32,20 @@ class PartitionGNNConfig:
     model_variant: str = "gnn_fused"
     separate_ranking_heads: bool = False
     time_quantile_heads: bool = False
+    cost_risk_heads: bool = False
     message_operator: str = "edge_mlp"
+
+
+def monotone_feasibility_logits(raw_logits: Tensor) -> Tensor:
+    """
+    把四个原始输出转换为随成本阈值单调不减的可行性logit。
+
+    输入形状为[候选数, 4]；第一列是0%阈值logit，后三列表示非负增量；
+    输出保证P(cost<=0%)不大于P(cost<=5%)、P(cost<=7%)和P(cost<=10%)。
+    """
+    first = raw_logits[:, :1]
+    increments = torch.nn.functional.softplus(raw_logits[:, 1:])
+    return torch.cat((first, first + torch.cumsum(increments, dim=1)), dim=1)
 
 
 class DirectedPartitionGraphLayer(nn.Module):
@@ -214,6 +227,12 @@ class PartitionPerformanceGNN(nn.Module):
         )
         self.right_censored_head = nn.Linear(hidden, 1)
         self.cost_feasible_head = nn.Linear(hidden, 1)
+        # 多阈值分类与成本分位数仅在新版风险模型中启用，旧检查点结构保持不变。
+        self.cost_threshold_head = (
+            nn.Linear(hidden, len(COST_FEASIBILITY_THRESHOLDS))
+            if config.cost_risk_heads else None
+        )
+        self.cost_quantile_head = nn.Linear(hidden, 2) if config.cost_risk_heads else None
         self.group_log_phase2_head = nn.Linear(hidden, 1)
         self.group_right_censored_head = nn.Linear(hidden, 1)
         # 分位数头输出P50与非负增量，保证P90始终不小于P50。
@@ -318,6 +337,20 @@ class PartitionPerformanceGNN(nn.Module):
                 raw_group_quantiles[:, 0],
                 raw_group_quantiles[:, 0] + torch.nn.functional.softplus(
                     raw_group_quantiles[:, 1]
+                ),
+            ), dim=1)
+        if self.cost_threshold_head is not None and self.cost_quantile_head is not None:
+            threshold_logits = monotone_feasibility_logits(
+                self.cost_threshold_head(decision)
+            )
+            raw_cost_quantiles = self.cost_quantile_head(decision)
+            outputs["cost_feasible_threshold_logits"] = threshold_logits
+            # 10%列兼容原有单阈值接口，使旧的策略代码也会读取新版保守分类头。
+            outputs["cost_feasible_logit"] = threshold_logits[:, -1]
+            outputs["cost_change_quantiles"] = torch.stack((
+                raw_cost_quantiles[:, 0],
+                raw_cost_quantiles[:, 0] + torch.nn.functional.softplus(
+                    raw_cost_quantiles[:, 1]
                 ),
             ), dim=1)
         return outputs

@@ -79,6 +79,7 @@ def main() -> int:
                 message_operator=arguments.message_operator,
                 separate_ranking_heads=weighted,
                 time_quantile_heads=robust,
+                cost_risk_heads=robust,
                 max_epochs=arguments.max_epochs,
                 patience=arguments.patience,
                 model_variant="gnn_only",

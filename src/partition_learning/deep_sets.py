@@ -14,6 +14,10 @@ from .models import REGRESSION_TARGETS, TARGET_INDEX
 
 MODEL_VARIANTS = ("deepsets_only", "global_mlp", "fused")
 
+# 强化学习硬约束需要区分不同安全余量；顺序固定以便模型、报告和推理一致解释。
+COST_FEASIBILITY_THRESHOLDS = (0.0, 0.05, 0.07, 0.10)
+COST_FEASIBILITY_NAMES = ("0pct", "5pct", "7pct", "10pct")
+
 
 # 正值目标在数据集中使用 log1p 编码，降低长尾求解时间对训练的支配作用。
 POSITIVE_TARGET_INDICES = tuple(
@@ -53,6 +57,7 @@ class DeepSetBatch:
     target_mask: Tensor
     right_censored: Tensor
     cost_feasible: Tensor
+    cost_feasible_thresholds: Tensor
     cost_feasible_mask: Tensor
     group_log_phase2: Tensor
     group_time_mask: Tensor
@@ -98,6 +103,7 @@ class DeepSetsLossConfig:
     right_censored: float = 0.20
     group_right_censored: float = 0.15
     cost_feasible: float = 0.20
+    cost_feasible_thresholds: float = 0.0
     time_ranking: float = 0.15
     cost_ranking: float = 0.15
     feasible_time_ranking: float = 0.20
@@ -109,6 +115,7 @@ class DeepSetsLossConfig:
     downstream_consistency: float = 0.15
     time_quantile: float = 0.0
     group_time_quantile: float = 0.0
+    cost_quantile: float = 0.0
     censored_time_lower_bound: float = 0.0
     group_censored_time_lower_bound: float = 0.0
     # cost_change_ratio与final_cost信息部分重复，可降低前者权重避免比例噪声支配训练。
@@ -510,6 +517,26 @@ def hierarchical_deepsets_loss(
         cost_feasible_values * cost_feasible_weights,
         batch.cost_feasible_mask,
     )
+    threshold_logits = outputs.get("cost_feasible_threshold_logits")
+    if threshold_logits is None:
+        cost_threshold_loss = outputs["regression"].sum() * 0.0
+    else:
+        threshold_values = F.binary_cross_entropy_with_logits(
+            threshold_logits,
+            batch.cost_feasible_thresholds,
+            reduction="none",
+        )
+        # 误把真实超限样本判断为可行会直接破坏硬约束，因此提高负类权重。
+        threshold_weights = torch.where(
+            batch.cost_feasible_thresholds > 0.5,
+            torch.ones_like(threshold_values),
+            torch.full_like(threshold_values, weights.cost_infeasible_multiplier),
+        )
+        threshold_mask = batch.cost_feasible_mask[:, None].expand_as(threshold_values)
+        cost_threshold_loss = _masked_mean(
+            threshold_values * threshold_weights,
+            threshold_mask,
+        )
     time_ranking_loss = _pairwise_target_ranking_loss(
         outputs, batch, "downstream_total_seconds"
     )
@@ -630,12 +657,34 @@ def hierarchical_deepsets_loss(
             batch.group_right_censored > 0.5,
         )
 
+    cost_quantiles = outputs.get("cost_change_quantiles")
+    if cost_quantiles is None:
+        cost_quantile_loss = outputs["regression"].sum() * 0.0
+    else:
+        cost_index = TARGET_INDEX["cost_change_ratio"]
+        cost_mask = batch.target_mask[:, cost_index]
+        cost_quantile_loss = 0.5 * (
+            _masked_mean(
+                _pinball_loss(
+                    cost_quantiles[:, 0], batch.targets[:, cost_index], 0.50
+                ),
+                cost_mask,
+            )
+            + _masked_mean(
+                _pinball_loss(
+                    cost_quantiles[:, 1], batch.targets[:, cost_index], 0.90
+                ),
+                cost_mask,
+            )
+        )
+
     components = {
         "regression": regression_loss,
         "group_time": group_time_loss,
         "right_censored": right_censored_loss,
         "group_right_censored": group_right_censored_loss,
         "cost_feasible": cost_feasible_loss,
+        "cost_feasible_thresholds": cost_threshold_loss,
         "time_ranking": time_ranking_loss,
         "cost_ranking": cost_ranking_loss,
         "feasible_time_ranking": feasible_time_ranking_loss,
@@ -647,6 +696,7 @@ def hierarchical_deepsets_loss(
         "downstream_consistency": downstream_consistency_loss,
         "time_quantile": time_quantile_loss,
         "group_time_quantile": group_time_quantile_loss,
+        "cost_quantile": cost_quantile_loss,
         "censored_time_lower_bound": censored_time_lower_bound_loss,
         "group_censored_time_lower_bound": group_censored_time_lower_bound_loss,
     }
@@ -656,6 +706,7 @@ def hierarchical_deepsets_loss(
         + weights.right_censored * right_censored_loss
         + weights.group_right_censored * group_right_censored_loss
         + weights.cost_feasible * cost_feasible_loss
+        + weights.cost_feasible_thresholds * cost_threshold_loss
         + weights.time_ranking * time_ranking_loss
         + weights.cost_ranking * cost_ranking_loss
         + weights.feasible_time_ranking * feasible_time_ranking_loss
@@ -667,6 +718,7 @@ def hierarchical_deepsets_loss(
         + weights.downstream_consistency * downstream_consistency_loss
         + weights.time_quantile * time_quantile_loss
         + weights.group_time_quantile * group_time_quantile_loss
+        + weights.cost_quantile * cost_quantile_loss
         + weights.censored_time_lower_bound * censored_time_lower_bound_loss
         + weights.group_censored_time_lower_bound * group_censored_time_lower_bound_loss
     )

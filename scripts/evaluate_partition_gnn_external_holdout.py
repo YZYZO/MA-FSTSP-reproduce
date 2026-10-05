@@ -18,6 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.partition_learning.deep_sets import (  # noqa: E402
+    COST_FEASIBILITY_NAMES,
+    COST_FEASIBILITY_THRESHOLDS,
+)
 from src.partition_learning.deep_sets_training import (  # noqa: E402
     _classification_metrics,
     _regression_metrics,
@@ -94,6 +98,15 @@ def aggregate_member_predictions(
     if all("time_quantiles" in item for item in members):
         result["time_quantiles"] = np.mean(
             [item["time_quantiles"] for item in members], axis=0
+        )
+    if all("cost_change_quantiles" in item for item in members):
+        result["cost_change_quantiles"] = np.mean(
+            [item["cost_change_quantiles"] for item in members], axis=0
+        )
+    if all("cost_feasible_threshold_probability" in item for item in members):
+        result["cost_feasible_threshold_probability"] = np.mean(
+            [item["cost_feasible_threshold_probability"] for item in members],
+            axis=0,
         )
     return result
 
@@ -235,6 +248,34 @@ def evaluate_ensemble(
             "p90_censored_lower_bound_satisfaction": float(np.mean(
                 quantiles[censored > 0.5, 1] >= actual[censored > 0.5, time_index]
             )),
+        }
+
+    cost_change_index = TARGET_INDEX["cost_change_ratio"]
+    relative_cost_valid = masks[:, cost_change_index]
+    if "cost_change_quantiles" in ensemble:
+        cost_quantiles = ensemble["cost_change_quantiles"]
+        report["cost_change_quantiles"] = {
+            "p50_mae": float(np.mean(np.abs(
+                cost_quantiles[relative_cost_valid, 0]
+                - actual[relative_cost_valid, cost_change_index]
+            ))),
+            "p90_coverage": float(np.mean(
+                actual[relative_cost_valid, cost_change_index]
+                <= cost_quantiles[relative_cost_valid, 1]
+            )),
+        }
+    if "cost_feasible_threshold_probability" in ensemble:
+        threshold_probability = ensemble["cost_feasible_threshold_probability"]
+        report["cost_feasible_by_limit"] = {
+            name: _classification_metrics(
+                (
+                    actual[relative_cost_valid, cost_change_index] <= threshold
+                ).astype(np.float64),
+                threshold_probability[relative_cost_valid, index],
+            )
+            for index, (name, threshold) in enumerate(zip(
+                COST_FEASIBILITY_NAMES, COST_FEASIBILITY_THRESHOLDS
+            ))
         }
 
     rows = []

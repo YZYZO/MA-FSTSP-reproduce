@@ -41,6 +41,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--candidates", type=Path, default=DEFAULT_CANDIDATES)
     parser.add_argument("--result-root", type=Path, default=DEFAULT_RESULT_ROOT)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--group-cache",
+        type=Path,
+        help="可选的既有group_evaluations.sqlite3；用于跨候选批次复用仓库组真值。",
+    )
     parser.add_argument("--solver-time-limit", type=float, default=600.0)
     parser.add_argument("--solver-threads", type=int, default=1)
     parser.add_argument("--solver-seed", type=int, default=0)
@@ -78,6 +83,11 @@ def _configuration(arguments: argparse.Namespace, candidate_bytes: bytes) -> dic
         "distance_batch_size": int(arguments.distance_batch_size),
         "cost_limit": float(arguments.cost_limit),
         "evaluation_workers": 1,
+        "group_cache": (
+            str(arguments.group_cache.resolve())
+            if arguments.group_cache is not None
+            else None
+        ),
         "only_graph": arguments.only_graph,
         "customer_counts": arguments.customer_counts,
         "include_55k": bool(arguments.include_55k),
@@ -92,6 +102,16 @@ def _write_or_check_configuration(path: Path, configuration: dict) -> None:
             raise RuntimeError("输出目录已有不同配置，请为新预算使用新的输出目录。")
         return
     write_json(path, configuration)
+
+
+def _apply_group_cache(experiment, group_cache: Path | None) -> None:
+    """验证外部SQLite缓存存在，并让真实复核跨候选批次复用该缓存。"""
+    if group_cache is None:
+        return
+    resolved = group_cache.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"指定的仓库组缓存不存在：{resolved}")
+    experiment.cache_path = resolved
 
 
 def main() -> int:
@@ -124,6 +144,7 @@ def main() -> int:
         ),
         evaluation_workers=1,
     )
+    _apply_group_cache(experiment, arguments.group_cache)
     records = evaluate_validation_candidates(experiment, payload, output_dir)
     report = save_validation_reports(
         records,
@@ -134,7 +155,8 @@ def main() -> int:
         print(
             f"[RL validation] 完成 {instance_id}: "
             f"exact={summary['exact_candidate_count']}/{summary['candidate_count']} "
-            f"ppo_best={summary['ppo_best_verdict']}",
+            f"ppo_best={summary['ppo_best_verdict']} "
+            f"hard_constraint_success={summary['hard_constraint_success']}",
             flush=True,
         )
     return 0
